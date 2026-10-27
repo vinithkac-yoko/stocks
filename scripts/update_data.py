@@ -18,6 +18,7 @@ import argparse
 import csv
 import io
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -26,9 +27,36 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-UNIVERSE_CACHE = ROOT / "data" / "nifty500.csv"
-HISTORY_PATH = ROOT / "data" / "history.json"
-OUTPUT_PATH = ROOT / "docs" / "data" / "latest.json"
+
+
+# Where state lives. On a server, DATA_DIR (e.g. a mounted volume) holds everything; in a
+# checkout the files sit under data/ and docs/data/ as before. Resolved per call so tests can
+# point it elsewhere.
+def _data_dir() -> Path | None:
+    value = os.environ.get("DATA_DIR")
+    return Path(value) if value else None
+
+
+def universe_cache() -> Path:
+    return (_data_dir() or ROOT / "data") / "nifty500.csv"
+
+
+def history_path() -> Path:
+    return (_data_dir() or ROOT / "data") / "history.json"
+
+
+def output_path() -> Path:
+    d = _data_dir()
+    return d / "latest.json" if d else ROOT / "docs" / "data" / "latest.json"
+
+
+def write_atomic(path: Path, text: str) -> None:
+    """Readers (the web server) never see a half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
 
 UNIVERSE_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
 BHAV_URL = "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{ddmmyyyy}.csv"
@@ -88,22 +116,26 @@ def num(value: str | None) -> float | None:
         return None
 
 
-def load_universe(path: Path | None) -> dict[str, dict[str, str]]:
-    """symbol -> {name, industry}. Order of preference: given file, fresh download, cache."""
+def load_universe(path: Path | None, prefer_cache: bool = False) -> dict[str, dict[str, str]]:
+    """symbol -> {name, industry}. Order of preference: given file, fresh download, cache.
+
+    prefer_cache puts the cache first, so ingesting a hand-supplied file makes no network calls.
+    """
     text: str | None = None
     if path:
         text = path.read_text(encoding="utf-8")
+    elif prefer_cache and universe_cache().exists():
+        text = universe_cache().read_text(encoding="utf-8")
     else:
         try:
             body = fetch(UNIVERSE_URL)
             if body:
                 text = body.decode("utf-8", "replace")
-                UNIVERSE_CACHE.parent.mkdir(parents=True, exist_ok=True)
-                UNIVERSE_CACHE.write_text(text, encoding="utf-8")
+                write_atomic(universe_cache(), text)
         except RuntimeError as e:
             log(f"universe download failed ({e}); trying cache")
-    if text is None and UNIVERSE_CACHE.exists():
-        text = UNIVERSE_CACHE.read_text(encoding="utf-8")
+    if text is None and universe_cache().exists():
+        text = universe_cache().read_text(encoding="utf-8")
     if text is None:
         raise SystemExit("No NIFTY 500 list available. Download ind_nifty500list.csv and pass --universe-file.")
     universe = {}
@@ -134,8 +166,8 @@ def parse_bhav(text: str, universe: dict) -> dict[str, list]:
 
 
 def load_history() -> dict:
-    if HISTORY_PATH.exists():
-        return json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
+    if history_path().exists():
+        return json.loads(history_path().read_text(encoding="utf-8"))
     return {"days": {}, "holidays": []}
 
 
@@ -192,22 +224,21 @@ def build_output(history: dict, universe: dict) -> dict:
     }
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--universe-file", type=Path, help="local ind_nifty500list.csv instead of downloading")
-    ap.add_argument("--bhav-file", type=Path, help="local sec_bhavdata_full csv to ingest (needs --bhav-date)")
-    ap.add_argument("--bhav-date", help="YYYY-MM-DD session date of --bhav-file")
-    ap.add_argument("--today", help="YYYY-MM-DD, override 'today' (IST)")
-    args = ap.parse_args()
-
-    universe = load_universe(args.universe_file)
+def run(universe_file: Path | None = None, bhav_text: str | None = None,
+        bhav_date: str | None = None, today: date | None = None) -> int:
+    """Refresh history and latest.json. Returns 0 on success, 1 if nothing could be produced."""
+    universe = load_universe(universe_file, prefer_cache=bhav_text is not None)
     history = load_history()
-    today = date.fromisoformat(args.today) if args.today else datetime.now(IST).date()
+    today = today or datetime.now(IST).date()
 
-    if args.bhav_file:
-        if not args.bhav_date:
-            ap.error("--bhav-file needs --bhav-date")
-        history["days"][args.bhav_date] = parse_bhav(args.bhav_file.read_text(encoding="utf-8"), universe)
+    if bhav_text is not None:
+        if not bhav_date:
+            raise ValueError("bhav_text needs bhav_date")
+        parsed = parse_bhav(bhav_text, universe)
+        if not parsed:
+            log("Uploaded file matched no NIFTY 500 symbols; leaving output untouched.")
+            return 1
+        history["days"][bhav_date] = parsed
     else:
         # one more than the window so the newest session still has a full 20 to compare against
         collect_sessions(history, universe, today, want=AVG_WINDOW + 1)
@@ -223,12 +254,27 @@ def main() -> int:
         log("Latest session matched zero universe symbols; leaving output untouched.")
         return 1
 
-    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    HISTORY_PATH.write_text(json.dumps(history, separators=(",", ":")), encoding="utf-8")
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT_PATH.write_text(json.dumps(out, separators=(",", ":")), encoding="utf-8")
+    write_atomic(history_path(), json.dumps(history, separators=(",", ":")))
+    write_atomic(output_path(), json.dumps(out, separators=(",", ":")))
     log(f"asOf {out['asOf']}: {len(out['stocks'])}/{len(universe)} stocks, {out['sessionsUsed']} prior sessions")
     return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--universe-file", type=Path, help="local ind_nifty500list.csv instead of downloading")
+    ap.add_argument("--bhav-file", type=Path, help="local sec_bhavdata_full csv to ingest (needs --bhav-date)")
+    ap.add_argument("--bhav-date", help="YYYY-MM-DD session date of --bhav-file")
+    ap.add_argument("--today", help="YYYY-MM-DD, override 'today' (IST)")
+    args = ap.parse_args()
+    if args.bhav_file and not args.bhav_date:
+        ap.error("--bhav-file needs --bhav-date")
+    return run(
+        universe_file=args.universe_file,
+        bhav_text=args.bhav_file.read_text(encoding="utf-8") if args.bhav_file else None,
+        bhav_date=args.bhav_date,
+        today=date.fromisoformat(args.today) if args.today else None,
+    )
 
 
 if __name__ == "__main__":

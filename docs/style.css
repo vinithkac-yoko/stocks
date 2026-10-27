@@ -35,6 +35,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html { -webkit-text-size-adjust: 100%; }
 body {
   margin: 0; background: var(--page); color: var(--ink);
@@ -165,7 +166,8 @@ dialog p { margin: 0; }
   .cols { grid-template-columns: 1fr; }
 }
 @media (max-width: 640px) {
-  .opt { display: none; }
+  .opt, .opt2 { display: none; }
+  td.actions { white-space: normal; min-width: 96px; }
   .kpi .value { font-size: 24px; }
   td, th { padding: 8px 8px; }
   .rv .bar { width: 36px; }
@@ -174,3 +176,5 @@ dialog p { margin: 0; }
 @media (prefers-reduced-motion: no-preference) {
   .track > i, .rv .bar i { transition: width 0.25s ease; }
 }
+
+td.actions { white-space: nowrap; }
