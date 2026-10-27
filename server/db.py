@@ -1,8 +1,10 @@
 """SQLite storage for cycles, picks and sells. Standard library only.
 
-A pick is a stock you reviewed in a cycle. Once you invest it carries an entry price, quantity
-and date. Sells are separate rows so a position can be closed in pieces:
+A pick is a stock you reviewed in a cycle, and ends up in one of three states: undecided
+("picked"), "ignored", or "invested" (it then carries an entry price, quantity and date).
+Sells are separate rows so a position can be closed in pieces:
     open quantity = bought quantity - sum(sells.qty)
+A stock bought in several cycles is several lots; sells made by symbol use the oldest lot first.
 """
 from __future__ import annotations
 
@@ -76,6 +78,9 @@ class Store:
         with self._conn() as c:
             c.execute("pragma journal_mode = wal")
             c.executescript(SCHEMA)
+            # Added after the first release: databases that already exist are upgraded in place.
+            if "ignored" not in {r["name"] for r in c.execute("pragma table_info(picks)")}:
+                c.execute("alter table picks add column ignored integer not null default 0")
 
     @contextmanager
     def _conn(self):
@@ -103,7 +108,7 @@ class Store:
                 sells.setdefault(r["pick_id"], []).append({"id": r["id"], "qty": r["qty"], "price": r["price"], "soldOn": r["sold_on"]})
             picks = [{
                 "id": r["id"], "cycleId": r["cycle_id"], "symbol": r["symbol"], "pickedOn": r["picked_on"],
-                "status": r["status"], "entryPrice": r["entry_price"], "qty": r["qty"], "investedOn": r["invested_on"],
+                "status": "ignored" if r["ignored"] and r["status"] == "picked" else r["status"], "entryPrice": r["entry_price"], "qty": r["qty"], "investedOn": r["invested_on"],
                 "sells": sells.get(r["id"], []),
             } for r in c.execute("select * from picks order by id")]
         return {"cycles": cycles, "picks": picks}
@@ -149,7 +154,7 @@ class Store:
             _, sold = self._pick(c, pick_id)
             if qty < sold:
                 raise ApiError(400, f"Quantity can't be below the {sold} already sold.")
-            c.execute("update picks set status = 'invested', entry_price = ?, qty = ?, invested_on = ? where id = ?",
+            c.execute("update picks set status = 'invested', ignored = 0, entry_price = ?, qty = ?, invested_on = ? where id = ?",
                       (entry_price, qty, invested_on, pick_id))
 
     def clear_invested(self, pick_id: int) -> None:
@@ -157,7 +162,14 @@ class Store:
             _, sold = self._pick(c, pick_id)
             if sold:
                 raise ApiError(409, "This stock has sales recorded. Undo them first.")
-            c.execute("update picks set status = 'picked', entry_price = null, qty = null, invested_on = null where id = ?", (pick_id,))
+            c.execute("update picks set status = 'picked', ignored = 0, entry_price = null, qty = null, invested_on = null where id = ?", (pick_id,))
+
+    def set_ignored(self, pick_id: int, ignored: bool) -> None:
+        with self._conn() as c:
+            row, _ = self._pick(c, pick_id)
+            if row["status"] == "invested":
+                raise ApiError(409, "Already invested. Undo the investment first.")
+            c.execute("update picks set ignored = ? where id = ?", (1 if ignored else 0, pick_id))
 
     def add_sell(self, pick_id: int, qty, price, sold_on) -> int:
         qty, price, sold_on = _qty(qty), _price(price), _date(sold_on, "soldOn")
@@ -169,6 +181,33 @@ class Store:
             if qty > open_qty:
                 raise ApiError(400, f"Only {open_qty} left to sell.")
             return c.execute("insert into sells (pick_id, qty, price, sold_on) values (?, ?, ?, ?)", (pick_id, qty, price, sold_on)).lastrowid
+
+    def sell_holding(self, symbol, qty, price, sold_on) -> list[dict]:
+        """Sell `qty` shares of a stock across its open lots, oldest first, in one transaction."""
+        symbol = str(symbol or "").upper()
+        if not SYMBOL_RE.match(symbol):
+            raise ApiError(400, "invalid symbol")
+        qty, price, sold_on = _qty(qty), _price(price), _date(sold_on, "soldOn")
+        with self._conn() as c:
+            lots = c.execute(
+                """select p.id, p.qty - coalesce(sum(s.qty), 0) as open_qty
+                   from picks p left join sells s on s.pick_id = p.id
+                   where p.symbol = ? and p.status = 'invested'
+                   group by p.id having open_qty > 0
+                   order by p.invested_on, p.id""", (symbol,)).fetchall()
+            held = sum(r["open_qty"] for r in lots)
+            if qty > held:
+                raise ApiError(400, f"You hold {held} of {symbol}.")
+            created, remaining = [], qty
+            for lot in lots:
+                take = min(remaining, lot["open_qty"])
+                sid = c.execute("insert into sells (pick_id, qty, price, sold_on) values (?, ?, ?, ?)",
+                                (lot["id"], take, price, sold_on)).lastrowid
+                created.append({"id": sid, "pickId": lot["id"], "qty": take})
+                remaining -= take
+                if not remaining:
+                    break
+            return created
 
     def remove_sell(self, sell_id: int) -> None:
         with self._conn() as c:

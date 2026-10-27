@@ -89,7 +89,9 @@ main { padding-top: 16px; padding-bottom: 64px; outline: none; }
 .empty { padding: 28px 16px; text-align: center; color: var(--muted); }
 
 /* today's batch rows */
-.batch-row { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--grid); }
+.batch-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; padding: 12px 16px; border-bottom: 1px solid var(--grid); }
+.batch-row .hold { flex: 0 0 100%; font-size: 13px; color: var(--ink-2); }
+.batch-row .acts { flex: 0 0 100%; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .batch-row:last-child { border-bottom: 0; }
 .batch-row .who { flex: 1; min-width: 0; }
 .sym { font-weight: 600; }
@@ -168,8 +170,10 @@ dialog p { margin: 0; }
 @media (max-width: 640px) {
   .opt, .opt2 { display: none; }
   td.actions { white-space: normal; min-width: 96px; }
+  .rv .bar { display: none; }
+  .name { max-width: 96px; }
   .kpi .value { font-size: 24px; }
-  td, th { padding: 8px 8px; }
+  td, th { padding: 8px 6px; }
   .rv .bar { width: 36px; }
   .search { max-width: none; }
 }

@@ -2,11 +2,12 @@
 
 A small dashboard for working through the NIFTY 500, ten stocks a day.
 
-- Every evening the server downloads NSE's free end-of-day file and ranks the NIFTY 500 by **relative volume** (today's volume ÷ 20-day average). Turnover and raw shares are one tap away.
-- Each day you add 10 stocks from the ranked list to **Today's batch**, look at them however you like, and mark the ones you **invest** in (entry price, quantity, date).
-- A stock you've added is "reviewed" and drops out of the list for the rest of the **cycle**. After about 50 days all 500 are done and you start a new cycle. Your portfolio carries over.
-- **Sell** all or part of a position with an exit price. The portfolio shows open positions with unrealised P&L, a list of sales with realised P&L, and totals. P&L is before brokerage and taxes.
-- Counters: today's batch (x/10), cycle progress (x/500, day n of 50), invested this cycle, open positions with money deployed.
+- The list is the NIFTY 500 **ordered by market cap, largest first**, with relative volume, turnover and delivery % alongside. You can re-sort by any of them.
+- Tap **Get today's 10** for the next ten on the list. For each you choose **Invest** (just type the number of shares; the price is pre-filled with the current rate), **Ignore**, or, if you already hold it, **Sell**.
+- A stock you've added is "reviewed" and drops off the list for the rest of the **cycle**. At ten a day all 500 take about 50 days, then you start a new cycle. When a stock you still hold comes round again, its row shows "You hold 100 · avg …" with **Sell** next to Invest and Ignore.
+- **Sell** all or part. From Today it sells from the whole holding, oldest purchase first; from Portfolio you can sell from one specific purchase. The portfolio shows open positions with unrealised P&L, a list of sales with realised P&L, and totals. P&L is before brokerage and taxes.
+- Counters: today's batch (invested / ignored / to decide), cycle progress (x/500, day n of 50), invested this cycle, open positions with money deployed.
+- "Current rate" is the latest end-of-day close from NSE. There are no live prices.
 
 There is deliberately no charting or analysis: that part is yours.
 
@@ -41,7 +42,28 @@ curl -X POST "$URL/api/admin/upload?kind=bhav&date=2026-10-24" -H "Authorization
      --data-binary @sec_bhavdata_full_24102026.csv
 ```
 
+(The market cap file, `kind=mcap`, is covered in the next section.)
+
 Upload the last ~20 trading days (oldest first) so relative volume has history; with fewer than 5 earlier sessions the list ranks by turnover instead. After that, one upload a day keeps it current if the automatic download stays blocked.
+
+## Market cap
+
+NSE's daily bhavcopy has prices but no share counts, so market cap needs one more NSE file: the **MCAP** report (NSE circular 16/2024), which lists each security's issue size (shares outstanding). Share counts change rarely, so the server stores them and computes `market cap = close × shares` from each day's close.
+
+Until it is loaded the page says so and orders by turnover (large caps still rise to the top). To load it, download the MCAP file from NSE's All Reports page (nseindia.com → Resources → All Reports, Capital Market daily section) and upload it once; repeat every few months, or after big corporate actions:
+
+```bash
+curl -X POST "$URL/api/admin/upload?kind=mcap" -H "Authorization: Bearer $PASSCODE" \
+     --data-binary @MCAP24102026.csv
+```
+
+The file needs a `Symbol` column and an `Issue Size` column (or `Market Cap` with `Close Price`, from which shares are derived). Check the result against a number you know: Reliance should be around ₹18–20 lakh crore.
+
+To make it refresh by itself, copy the file's download link from NSE and set the Railway variable `MCAP_URL` to that link with the date replaced by `{ddmmyyyy}`, for example `https://…/MCAP{ddmmyyyy}.csv`. The server then re-reads it at most weekly. I could not confirm NSE's exact file location from the build environment, so this one is for you to set.
+
+## Updating an existing deployment
+
+Merging to `main` redeploys on Railway. Your database on the volume upgrades itself in place (it gains an "ignored" flag), and nothing is deleted.
 
 ## Security
 

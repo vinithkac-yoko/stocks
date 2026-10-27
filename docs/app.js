@@ -8,7 +8,7 @@ const MIN_SESSIONS_FOR_RELVOL = 5;
 const S = {
   store: null, data: null, stockMap: new Map(),
   cycles: [], picks: [], refresh: null, ephemeral: false,
-  tab: 'today', rank: 'relVol', q: '', investingId: null, sellingId: null,
+  tab: 'today', rank: 'relVol', q: '', investingId: null, selling: null,
 };
 
 // ------------------------------------------------------------- helpers ----
@@ -49,11 +49,35 @@ function fmtShort(iso) {
   if (y !== new Date().getFullYear()) opts.year = '2-digit';
   return new Date(y, m - 1, d).toLocaleDateString('en-IN', opts);
 }
+// Market cap arrives in crore rupees; large caps read better in lakh crore.
+const crore = (n) => (n >= 1e5 ? `${(n / 1e5).toFixed(2)} L Cr` : `${Math.round(n).toLocaleString('en-IN')} Cr`);
 const pct = (n) => `${Math.abs(n).toFixed(2)}%`;
 const changePct = (s) => (s && s.prevClose ? ((s.close - s.prevClose) / s.prevClose) * 100 : null);
 
 const soldQty = (p) => p.sells.reduce((a, s) => a + s.qty, 0);
 const openQty = (p) => (p.status === 'invested' ? p.qty - soldQty(p) : 0);
+
+const cmpId = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true });
+const lotOrder = (a, b) => (a.investedOn || '').localeCompare(b.investedOn || '') || cmpId(a.id, b.id);
+// A stock bought in several cycles is several lots; selling by symbol takes the oldest lot first.
+const lotsOf = (symbol) => S.picks.filter((p) => p.symbol === symbol && openQty(p) > 0).sort(lotOrder);
+function holdingOf(symbol) {
+  const lots = lotsOf(symbol), qty = lots.reduce((n, p) => n + openQty(p), 0);
+  if (!qty) return null;
+  return { lots, qty, avg: lots.reduce((n, p) => n + openQty(p) * p.entryPrice, 0) / qty };
+}
+// Which lots (and how many shares of each) a sale touches. `sel` is {id} for one lot or {symbol} for the holding.
+function allocate(sel, qty) {
+  const lots = sel.id != null ? [findPick(sel.id)].filter(Boolean) : lotsOf(sel.symbol);
+  const out = [];
+  let left = qty;
+  for (const pick of lots) {
+    const take = Math.min(left, openQty(pick));
+    if (take > 0) out.push({ pick, qty: take });
+    left -= take;
+  }
+  return left > 0 || !out.length ? null : out;
+}
 
 let toastTimer;
 function toast(msg) {
@@ -102,14 +126,15 @@ function stats() {
     daysUsed: new Set(cyclePicks.map((p) => p.pickedOn)).size,
     cycleDays: Math.ceil(universe / BATCH) || 0,
     todays, todaysInvested: todays.filter((p) => p.status === 'invested').length,
+    todaysIgnored: todays.filter((p) => p.status === 'ignored').length,
     investedInCycle: cyclePicks.filter((p) => p.status === 'invested').length,
     open, deployed, unrealised, unrealisedPct: costPriced ? (unrealised / costPriced) * 100 : null,
     realised, sales, wins,
   };
 }
 
-function ranked(pickedSymbols) {
-  const key = S.rank, q = S.q.trim().toLowerCase();
+function ranked(pickedSymbols, withSearch = true) {
+  const key = S.rank, q = withSearch ? S.q.trim().toLowerCase() : '';
   const val = (s) => (s[key] == null ? -1 : s[key]);
   return S.data.stocks
     .filter((s) => !pickedSymbols.has(s.symbol))
@@ -149,6 +174,7 @@ function renderChrome() {
   const age = (Date.now() - new Date(S.data.asOf).getTime()) / 864e5;
   const msgs = [];
   if (S.ephemeral) msgs.push('<b>No volume attached.</b> Your picks and sales will be erased on the next deploy. Add a Railway volume (see README).');
+  if (!S.data.demo && !(S.data.mcap && S.data.mcap.loaded)) msgs.push('Market cap isn\'t loaded yet, so the list is ordered by turnover. Upload NSE\'s MCAP file (see README).');
   if (S.data.demo) msgs.push('<b>Demo data.</b> Made-up stocks and numbers, until the first NSE download succeeds.');
   else if (age > 5) msgs.push(`Data is from ${fmtDate(S.data.asOf)}; the daily update may be failing.`);
   if (S.refresh && S.refresh.error) msgs.push(`Last NSE update failed: ${esc(S.refresh.error)}`);
@@ -166,7 +192,7 @@ function renderKpis(st) {
     ? delta(st.unrealised, `${money(Math.abs(st.unrealised))} (${pct(st.unrealisedPct)})`)
     : 'No open positions';
   return `<div class="kpis">
-    ${kpi("Today's batch", `${st.todays.length} <small>/ ${BATCH}</small>`, `${st.todaysInvested} invested · ${st.todays.length - st.todaysInvested} to decide`)}
+    ${kpi("Today's batch", `${st.todays.length} <small>/ ${BATCH}</small>`, `${st.todaysInvested} invested · ${st.todaysIgnored} ignored · ${st.todays.length - st.todaysInvested - st.todaysIgnored} to decide`)}
     ${kpi('Cycle progress', `${st.reviewed} <small>/ ${st.universe}</small>`,
       st.daysUsed ? `Day ${st.daysUsed} of ${st.cycleDays} · ${st.remaining} left` : `${st.cycleDays} days at ${BATCH} a day`,
       `<div class="track" role="progressbar" aria-label="Cycle progress" aria-valuenow="${st.reviewed}" aria-valuemin="0" aria-valuemax="${st.universe}"><i style="width:${progress.toFixed(1)}%"></i></div>`)}
@@ -187,21 +213,38 @@ function renderPortfolioKpis(st) {
 }
 
 function badge(p) {
+  if (p.status === 'ignored') return '<span class="badge">Ignored</span>';
+  if (p.status !== 'invested') return '';
   const open = openQty(p), sold = p.qty - open;
   if (open === 0) return '<span class="badge">Sold</span>';
   return `<span class="badge in">✓ ${open} × ${price(p.entryPrice)}${sold ? ` · ${sold} sold` : ''}</span>`;
 }
 
+// The decision buttons for a pick, shared by Today and History.
+function decisionButtons(p, small = true) {
+  const sm = small ? ' sm' : '';
+  const h = holdingOf(p.symbol);
+  let acts;
+  if (p.status === 'invested') acts = `${badge(p)}<button class="btn quiet${sm}" data-action="invest" data-id="${p.id}">Edit</button>`;
+  else if (p.status === 'ignored') acts = `${badge(p)}<button class="btn quiet${sm}" data-action="unignore" data-id="${p.id}">Decide</button>`;
+  else acts = `<button class="btn primary${sm}" data-action="invest" data-id="${p.id}">Invest</button><button class="btn${sm}" data-action="ignore" data-id="${p.id}">Ignore</button>`;
+  if (h) acts += `<button class="btn${sm}" data-action="sellholding" data-sym="${esc(p.symbol)}">Sell</button>`;
+  return acts;
+}
+
 function batchRow(p) {
-  const s = S.stockMap.get(p.symbol), ch = changePct(s);
-  const action = p.status === 'invested'
-    ? `${badge(p)}<button class="btn quiet sm" data-action="invest" data-id="${p.id}">Edit</button>`
-    : `<button class="btn primary sm" data-action="invest" data-id="${p.id}">Invest</button>`;
+  const s = S.stockMap.get(p.symbol), ch = changePct(s), h = holdingOf(p.symbol);
+  let hold = '';
+  if (h) {
+    const pl = s ? (s.close - h.avg) * h.qty : null;
+    hold = `<div class="hold">You hold <b class="num">${h.qty}</b> · avg ${price(h.avg)}${s ? ` · ${delta(pl, pct(((s.close - h.avg) / h.avg) * 100))}` : ''}</div>`;
+  }
   return `<div class="batch-row">
     <div class="who"><span class="sym">${esc(p.symbol)}</span><span class="name">${esc(s ? s.name : '')}</span></div>
     <div class="price num">${s ? price(s.close) : '—'}<small>${delta(ch, ch == null ? '' : pct(ch))}</small></div>
-    ${action}
     <button class="btn quiet sm" data-action="remove" data-id="${p.id}" aria-label="Remove ${esc(p.symbol)} from today's batch" title="Remove">✕</button>
+    ${hold}
+    <div class="acts">${decisionButtons(p)}</div>
   </div>`;
 }
 
@@ -209,16 +252,17 @@ function poolRows(st) {
   const picked = new Set(st.cyclePicks.map((p) => p.symbol));
   const full = st.todays.length >= BATCH;
   const rows = ranked(picked);
-  if (!rows.length) return `<tr><td colspan="8" class="empty">${S.q ? 'No match in the remaining list.' : 'Everything has been reviewed this cycle.'}</td></tr>`;
+  if (!rows.length) return `<tr><td colspan="9" class="empty">${S.q ? 'No match in the remaining list.' : 'Everything has been reviewed this cycle.'}</td></tr>`;
   return rows.map((s, i) => {
     const ch = changePct(s);
     const rv = s.relVol == null ? '<span class="muted">—</span>'
       : `<div class="rv"><span class="bar"><i style="width:${Math.min(s.relVol / REL_VOL_BAR_MAX, 1) * 100}%"></i></span><b class="num">${s.relVol.toFixed(2)}×</b></div>`;
     return `<tr>
-      <td class="rank num">${i + 1}</td>
+      <td class="rank num opt2">${i + 1}</td>
       <td><span class="sym">${esc(s.symbol)}</span><span class="name">${esc(s.name)}</span></td>
-      <td class="r num">${price(s.close)}</td>
-      <td class="r">${delta(ch, ch == null ? '' : pct(ch))}</td>
+      <td class="r num">${s.mcapCr == null ? '—' : crore(s.mcapCr)}</td>
+      <td class="r num opt2">${price(s.close)}</td>
+      <td class="r opt2">${delta(ch, ch == null ? '' : pct(ch))}</td>
       <td class="r">${rv}</td>
       <td class="r num opt">${qtyCompact(s.volume)}</td>
       <td class="r num opt">${s.delivPct == null ? '—' : s.delivPct.toFixed(1) + '%'}</td>
@@ -231,16 +275,18 @@ function renderToday(st) {
   const lowHistory = S.data.sessionsUsed < MIN_SESSIONS_FOR_RELVOL;
   const batch = st.todays.length
     ? st.todays.map(batchRow).join('')
-    : `<div class="empty">Tap <b>Add</b> on stocks in the ranked list to build today's batch of ${BATCH}.</div>`;
+    : `<div class="empty">Tap <b>Get today's ${BATCH}</b> for the next ${BATCH} on the list, or <b>Add</b> stocks yourself.</div>`;
   const done = st.universe > 0 && st.remaining === 0;
-  const seg = [['relVol', 'Rel. volume'], ['turnoverCr', 'Turnover'], ['volume', 'Shares']]
+  const need = Math.min(BATCH - st.todays.length, ranked(new Set(st.cyclePicks.map((p) => p.symbol)), false).length);
+  const fill = need > 0 ? `<button class="btn primary sm" data-action="fill" title="Adds the next ${need} from the ranked list, in the order shown">${st.todays.length ? `Add next ${need}` : `Get today's ${need}`}</button>` : '';
+  const seg = [['mcapCr', 'Mkt cap'], ['relVol', 'Rel. vol'], ['turnoverCr', 'Turnover'], ['volume', 'Shares']]
     .map(([k, l]) => `<button data-action="rank" data-rank="${k}" aria-pressed="${S.rank === k}">${l}</button>`).join('');
   return `${renderKpis(st)}
   ${done ? `<div class="panel" style="margin-bottom:20px"><div class="empty"><b>Cycle complete.</b> All ${st.universe} stocks reviewed.<br><br>
     <button class="btn primary" data-action="newcycle">Start a new cycle</button></div></div>` : ''}
   <div class="cols">
     <section class="panel" aria-label="Today's batch">
-      <div class="panel-head"><h2>Today's batch</h2><span class="muted num">${st.todays.length} / ${BATCH}</span></div>
+      <div class="panel-head"><h2>Today's batch</h2><span class="muted num">${st.todays.length} / ${BATCH}</span>${fill}</div>
       ${batch}
     </section>
     <section class="panel" aria-label="Ranked list">
@@ -249,9 +295,9 @@ function renderToday(st) {
         <div class="seg" role="group" aria-label="Rank by">${seg}</div>
         <input class="search" type="search" id="search" placeholder="Search symbol or name" value="${esc(S.q)}" aria-label="Search">
       </div>
-      ${lowHistory ? `<div class="pad muted" style="padding-bottom:0">Only ${S.data.sessionsUsed} earlier session(s) loaded, so relative volume is not available yet. Use Turnover for now.</div>` : ''}
+      ${lowHistory && S.rank === 'relVol' ? `<div class="pad muted" style="padding-bottom:0">Only ${S.data.sessionsUsed} earlier session(s) loaded, so relative volume is not available yet. Use Turnover for now.</div>` : ''}
       <div class="scroll"><table>
-        <thead><tr><th>#</th><th>Stock</th><th class="r">Price</th><th class="r">Change</th>
+        <thead><tr><th class="opt2">#</th><th>Stock</th><th class="r">Mkt cap</th><th class="r opt2">Price</th><th class="r opt2">Change</th>
           <th class="r" title="Today's volume ÷ 20-day average">Rel. volume</th><th class="r opt">Volume</th><th class="r opt" title="Delivery % of traded quantity">Deliv.</th><th></th></tr></thead>
         <tbody id="poolBody">${poolRows(st)}</tbody>
       </table></div>
@@ -332,11 +378,9 @@ function renderHistory(st) {
   const days = [...groups.keys()].sort().reverse().map((d) => {
     const ps = groups.get(d);
     const pills = ps.map((p) => `<span class="pill"><span class="sym">${esc(p.symbol)}</span>
-      ${p.status === 'invested'
-        ? `${badge(p)}<button class="btn quiet" data-action="invest" data-id="${p.id}">Edit</button>`
-        : `<button class="btn" data-action="invest" data-id="${p.id}">Invest</button>`}
+      ${decisionButtons(p, false)}
       <button class="btn quiet" data-action="remove" data-id="${p.id}" aria-label="Remove ${esc(p.symbol)}">✕</button></span>`).join('');
-    return `<div class="day"><h3>${fmtDate(d, true)} · ${ps.length} picked · ${ps.filter((p) => p.status === 'invested').length} invested</h3><div class="items">${pills}</div></div>`;
+    return `<div class="day"><h3>${fmtDate(d, true)} · ${ps.length} picked · ${ps.filter((p) => p.status === 'invested').length} invested · ${ps.filter((p) => p.status === 'ignored').length} ignored</h3><div class="items">${pills}</div></div>`;
   }).join('');
   const past = S.cycles.slice(0, -1).map((c) => {
     const ps = S.picks.filter((p) => p.cycleId === c.id);
@@ -367,7 +411,9 @@ function openInvest(id) {
   S.investingId = id;
   const s = S.stockMap.get(p.symbol), f = $('#investForm');
   $('#investTitle').textContent = p.status === 'invested' ? `Edit ${p.symbol}` : `Invest in ${p.symbol}`;
-  $('#investSub').textContent = (s ? `${s.name} · last close ${inr(s.close, 2)}` : '') + (soldQty(p) ? ` · ${soldQty(p)} already sold` : '');
+  const h = p.status === 'invested' ? null : holdingOf(p.symbol);
+  $('#investSub').textContent = (s ? `${s.name} · current rate ${inr(s.close, 2)}` : '')
+    + (soldQty(p) ? ` · ${soldQty(p)} already sold` : '') + (h ? ` · you already hold ${h.qty}` : '');
   f.price.value = p.entryPrice ?? (s ? s.close : '');
   f.qty.min = String(Math.max(1, soldQty(p)));
   f.qty.value = p.qty ?? '';
@@ -381,15 +427,18 @@ function updateInvestTotal() {
   $('#investTotal').textContent = t > 0 ? `Total: ${inr(t, 2)}` : '';
 }
 
-function openSell(id) {
-  const p = findPick(id);
-  if (!p || p._pending || openQty(p) <= 0) return;
-  S.sellingId = id;
-  const s = S.stockMap.get(p.symbol), f = $('#sellForm');
-  $('#sellTitle').textContent = `Sell ${p.symbol}`;
-  $('#sellSub').textContent = `${openQty(p)} held · bought at ${inr(p.entryPrice, 2)}${s ? ` · last close ${inr(s.close, 2)}` : ''}`;
-  f.qty.max = String(openQty(p));
-  f.qty.value = openQty(p);
+// sel: {id} sells from one purchase (Portfolio rows); {symbol} sells from the whole holding (Today).
+function openSell(sel) {
+  const lots = sel.id != null ? [findPick(sel.id)].filter((p) => p && openQty(p) > 0) : lotsOf(sel.symbol);
+  if (!lots.length || lots.some((p) => p._pending)) return;
+  const symbol = lots[0].symbol, held = lots.reduce((n, p) => n + openQty(p), 0);
+  const avg = lots.reduce((n, p) => n + openQty(p) * p.entryPrice, 0) / held;
+  S.selling = { ...sel, symbol };
+  const s = S.stockMap.get(symbol), f = $('#sellForm');
+  $('#sellTitle').textContent = `Sell ${symbol}`;
+  $('#sellSub').textContent = `${held} held${lots.length > 1 ? ` in ${lots.length} purchases` : ''} · ${lots.length > 1 ? 'average' : 'bought at'} ${inr(avg, 2)}${s ? ` · current rate ${inr(s.close, 2)}` : ''}`;
+  f.qty.max = String(held);
+  f.qty.value = held;
   f.price.value = s ? s.close : '';
   f.date.value = todayIST();
   updateSellPreview();
@@ -397,13 +446,14 @@ function openSell(id) {
   f.price.focus();
 }
 function updateSellPreview() {
-  const p = findPick(S.sellingId), f = $('#sellForm'), el = $('#sellPreview');
-  const q = Number(f.qty.value), px = Number(f.price.value);
-  if (!p || !(q > 0) || !(px > 0)) { el.textContent = ''; el.className = ''; return; }
-  const pl = (px - p.entryPrice) * q, plPct = ((px - p.entryPrice) / p.entryPrice) * 100;
+  const f = $('#sellForm'), el = $('#sellPreview');
+  const q = Number(f.qty.value), px = Number(f.price.value), alloc = S.selling && q > 0 ? allocate(S.selling, q) : null;
+  if (!alloc || !(px > 0)) { el.textContent = ''; el.className = ''; return; }
+  const cost = alloc.reduce((n, { pick, qty }) => n + pick.entryPrice * qty, 0), pl = px * q - cost;
   const word = pl > 0 ? 'Profit' : pl < 0 ? 'Loss' : 'Break-even';
   el.className = pl > 0 ? 'up' : pl < 0 ? 'down' : 'muted';
-  el.textContent = pl === 0 ? word : `${word} ${money(Math.abs(pl))} (${pl > 0 ? '+' : '−'}${pct(plPct)}) before charges`;
+  el.textContent = pl === 0 ? word : `${word} ${money(Math.abs(pl))} (${pl > 0 ? '+' : '−'}${pct((pl / cost) * 100)}) before charges`
+    + (alloc.length > 1 ? ', oldest purchase first' : '');
 }
 
 // -------------------------------------------------------------- events ----
@@ -420,7 +470,17 @@ document.addEventListener('click', (e) => {
     case 'close-dialog': el.closest('dialog').close(); break;
     case 'signout': S.store.logout().then(() => showLogin()); break;
     case 'invest': openInvest(pid); break;
-    case 'sell': openSell(pid); break;
+    case 'sell': openSell({ id: pid }); break;
+    case 'sellholding': openSell({ symbol: sym }); break;
+    case 'fill': fillBatch(); break;
+    case 'ignore':
+      if (!pick || pick._pending) break;
+      act(() => { pick.status = 'ignored'; }, () => S.store.setIgnored(pid, true), 'Could not save');
+      break;
+    case 'unignore':
+      if (!pick || pick._pending) break;
+      act(() => { pick.status = 'picked'; }, () => S.store.setIgnored(pid, false), 'Could not save');
+      break;
     case 'add': addPick(sym); break;
     case 'remove':
       if (!pick || pick._pending) break;
@@ -446,6 +506,13 @@ document.addEventListener('click', (e) => {
     }
   }
 });
+
+// "Get today's 10": the next stocks from the list in the order it is shown (ignoring the search box).
+function fillBatch() {
+  const st = stats();
+  const next = ranked(new Set(st.cyclePicks.map((p) => p.symbol)), false).slice(0, Math.max(0, BATCH - st.todays.length));
+  next.forEach((s) => addPick(s.symbol));
+}
 
 function addPick(symbol) {
   const st = stats();
@@ -476,14 +543,18 @@ document.addEventListener('submit', async (e) => {
     act(() => Object.assign(pick, { status: 'invested', entryPrice, qty, investedOn }), () => S.store.setInvested(pick.id, { entryPrice, qty, investedOn }), 'Could not save');
   } else if (form.id === 'sellForm') {
     e.preventDefault();
-    const qty = Math.floor(Number(form.qty.value)), px = Number(form.price.value), soldOn = form.date.value;
-    const pick = findPick(S.sellingId);
-    if (!pick) return;
+    const qty = Math.floor(Number(form.qty.value)), px = Number(form.price.value), soldOn = form.date.value, sel = S.selling;
+    if (!sel) return;
     if (!(qty > 0) || !(px > 0) || !soldOn) return toast('Enter a quantity, price and date.');
-    if (qty > openQty(pick)) return toast(`You only hold ${openQty(pick)}.`);
+    const alloc = allocate(sel, qty);
+    if (!alloc) return toast('You don\'t hold that many shares.');
     $('#sellDialog').close();
-    const sale = { id: `tmp${Math.random()}`, qty, price: px, soldOn, _pending: true };
-    act(() => pick.sells.push(sale), async () => { sale.id = await S.store.addSell(pick.id, { qty, price: px, soldOn }); delete sale._pending; render(); }, 'Could not record sale');
+    const sales = alloc.map(({ pick, qty: q }) => ({ pick, sale: { id: `tmp${Math.random()}`, qty: q, price: px, soldOn, _pending: true } }));
+    const apply = () => sales.forEach(({ pick, sale }) => pick.sells.push(sale));
+    const persist = sel.id != null
+      ? async () => { const { pick, sale } = sales[0]; sale.id = await S.store.addSell(pick.id, { qty, price: px, soldOn }); delete sale._pending; render(); }
+      : async () => { await S.store.sellHolding(sel.symbol, { qty, price: px, soldOn }); await reloadState(); };
+    act(apply, persist, 'Could not record sale');
   } else if (form.id === 'loginForm') {
     e.preventDefault();
     try { await S.store.login(form.pass.value); await start(); } catch (err) { showLogin(err.message); }
@@ -498,12 +569,19 @@ async function loadData() {
     if (!res.ok) throw new Error(res.status);
     S.data = await res.json();
     S.stockMap = new Map(S.data.stocks.map((s) => [s.symbol, s]));
-    if (S.data.sessionsUsed < MIN_SESSIONS_FOR_RELVOL) S.rank = 'turnoverCr';
+    // Default order: biggest companies first. Fall back to what the data can support.
+    S.rank = S.data.mcap && S.data.mcap.loaded ? 'mcapCr' : 'turnoverCr';
   } catch {
     $('#app').innerHTML = '<p class="pad">No market data yet. It downloads automatically after the NSE close; check the service logs if this persists.</p>';
     return false;
   }
   return true;
+}
+
+async function reloadState() {
+  const state = await S.store.load();
+  S.cycles = state.cycles; S.picks = state.picks;
+  render();
 }
 
 async function start() {

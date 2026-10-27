@@ -147,6 +147,23 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(c.call("DELETE", f"/api/sells/{sid}")[0], 200)
         self.assertEqual(c.call("DELETE", f"/api/picks/{pid}")[0], 200)
 
+    def test_ignore_and_sell_by_symbol_over_http(self):
+        c = self.authed()
+        cycle = c.call("GET", "/api/state")[1]["cycles"][-1]["id"]
+        pid = c.call("POST", "/api/picks", {"cycleId": cycle, "symbol": "M&M", "pickedOn": "2026-10-27"})[1]["id"]
+        self.assertEqual(c.call("POST", f"/api/picks/{pid}/ignore")[0], 200)
+        get = lambda: next(p for p in c.call("GET", "/api/state")[1]["picks"] if p["id"] == pid)  # noqa: E731
+        self.assertEqual(get()["status"], "ignored")
+        self.assertEqual(c.call("DELETE", f"/api/picks/{pid}/ignore")[0], 200)
+        self.assertEqual(get()["status"], "picked")
+        c.call("PUT", f"/api/picks/{pid}/invest", {"entryPrice": 100, "qty": 10, "investedOn": "2026-10-27"})
+        self.assertEqual(c.call("POST", f"/api/picks/{pid}/ignore")[0], 409)
+        status, res = c.call("POST", "/api/holdings/M%26M/sells", {"qty": 4, "price": 120, "soldOn": "2026-10-28"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual([(s["pickId"], s["qty"]) for s in res["sells"]], [(pid, 4)])
+        self.assertEqual(c.call("POST", "/api/holdings/M%26M/sells", {"qty": 7, "price": 120, "soldOn": "2026-10-28"})[0], 400)
+        self.assertEqual(c.call("POST", "/api/holdings/M%26M/sells", {"qty": 6, "price": 120, "soldOn": "2026-10-28"})[0], 200)
+
     def test_bad_json_is_a_400_not_a_crash(self):
         c = self.authed()
         self.assertEqual(c.call("POST", "/api/picks", raw=b"{not json", headers={"Content-Type": "application/json"})[0], 400)
@@ -166,6 +183,14 @@ class ServerTests(unittest.TestCase):
         self.assertFalse(data["demo"])
         self.assertEqual(data["stocks"][0]["symbol"], "AAA")
         self.assertEqual(c.call("POST", "/api/admin/upload?kind=bhav&date=bad", raw=BHAV.encode(), headers=bearer)[0], 400)
+
+        # market cap: bad file rejected, good file stores shares and rebuilds the list without network
+        self.assertEqual(c.call("POST", "/api/admin/upload?kind=mcap", raw=b"Symbol\nAAA\n", headers=bearer)[0], 422)
+        mcap = ("Symbol, Series, Issue Size, Close Price\nAAA, EQ, 1000000000, 110\n").encode()
+        self.assertEqual(c.call("POST", "/api/admin/upload?kind=mcap", raw=mcap, headers=bearer)[0], 200)
+        data = c.call("GET", "/data/latest.json")[1]
+        self.assertTrue(data["mcap"]["loaded"])
+        self.assertEqual(data["stocks"][0]["mcapCr"], 11000.0)  # 110 x 1e9 / 1e7
 
 
 class ConfigTests(unittest.TestCase):

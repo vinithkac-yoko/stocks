@@ -9,8 +9,14 @@ Relative volume = today's traded quantity / mean traded quantity of the previous
 (up to) 20 sessions. Daily snapshots are kept in data/history.json so each run only
 downloads sessions it has not seen before.
 
+Market cap = close x shares outstanding. Shares come from NSE's MCAP file (issue size per
+security), which changes rarely, so they are stored in shares.json and refreshed at most
+weekly: automatically when MCAP_URL is set (a URL template containing {ddmmyyyy}), or by
+passing the file with --mcap-file. Without shares, market cap is simply absent.
+
 Standard library only. If NSE blocks the download, pass the files yourself:
   python scripts/update_data.py --bhav-file sec_bhavdata_full_24102026.csv --bhav-date 2026-10-24
+  python scripts/update_data.py --mcap-file MCAP24102026.csv
 """
 from __future__ import annotations
 
@@ -45,6 +51,10 @@ def history_path() -> Path:
     return (_data_dir() or ROOT / "data") / "history.json"
 
 
+def shares_path() -> Path:
+    return (_data_dir() or ROOT / "data") / "shares.json"
+
+
 def output_path() -> Path:
     d = _data_dir()
     return d / "latest.json" if d else ROOT / "docs" / "data" / "latest.json"
@@ -62,6 +72,7 @@ UNIVERSE_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500lis
 BHAV_URL = "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{ddmmyyyy}.csv"
 
 IST = timezone(timedelta(hours=5, minutes=30))
+SHARES_MAX_AGE_DAYS = 7  # how stale shares.json may get before MCAP_URL is tried again
 AVG_WINDOW = 20      # sessions averaged for relative volume
 MIN_WINDOW = 5       # fewer prior sessions than this -> relative volume is unknown
 KEEP_SESSIONS = 40   # sessions retained in history.json
@@ -165,6 +176,68 @@ def parse_bhav(text: str, universe: dict) -> dict[str, list]:
     return out
 
 
+def parse_mcap(text: str, universe: dict) -> dict[str, int]:
+    """symbol -> shares outstanding, from NSE's MCAP file.
+
+    Columns are matched by name because NSE has changed layouts before: the share count is the
+    "Issue Size" column; if that is missing it is derived as market cap / close price.
+    """
+    rows = read_csv(text)
+    if not rows:
+        return {}
+    cols = list(rows[0])
+    find = lambda *needles: next((c for c in cols if any(n in c for n in needles)), None)  # noqa: E731
+    issue, mcap, close = find("ISSUE SIZE"), find("MARKET CAP", "MCAP"), find("CLOSE")
+    out: dict[str, int] = {}
+    for row in rows:
+        sym = row.get("SYMBOL")
+        if sym not in universe or (sym in out and row.get("SERIES") != "EQ"):
+            continue
+        shares = num(row.get(issue)) if issue else None
+        if shares is None and mcap and close:
+            m, c = num(row.get(mcap)), num(row.get(close))
+            shares = m / c if m and c else None
+        if shares and shares > 0:
+            out[sym] = int(shares)
+    return out
+
+
+def load_shares() -> dict | None:
+    try:
+        return json.loads(shares_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def save_shares(shares: dict[str, int], as_of: str) -> None:
+    write_atomic(shares_path(), json.dumps({"asOf": as_of, "shares": shares}, separators=(",", ":")))
+
+
+def refresh_shares(universe: dict, today: date) -> None:
+    """Best effort: fetch the MCAP file when MCAP_URL is set and shares.json is stale."""
+    template = os.environ.get("MCAP_URL")
+    if not template:
+        return
+    current = load_shares()
+    if current and (today - date.fromisoformat(current["asOf"])).days < SHARES_MAX_AGE_DAYS:
+        return
+    d = today
+    for _ in range(7):
+        if d.weekday() < 5:
+            try:
+                body = fetch(template.format(ddmmyyyy=d.strftime("%d%m%Y")))
+            except (RuntimeError, KeyError, IndexError) as e:
+                log(f"MCAP download failed ({e}); keeping existing shares")
+                return
+            shares = parse_mcap(body.decode("utf-8", "replace"), universe) if body else {}
+            if shares:
+                save_shares(shares, d.isoformat())
+                log(f"{d.isoformat()}: shares for {len(shares)} symbols")
+                return
+        d -= timedelta(days=1)
+    log("No MCAP file found at MCAP_URL for the last 7 days; keeping existing shares")
+
+
 def load_history() -> dict:
     if history_path().exists():
         return json.loads(history_path().read_text(encoding="utf-8"))
@@ -194,7 +267,11 @@ def collect_sessions(history: dict, universe: dict, today: date, want: int) -> N
     history["holidays"] = sorted(holidays)
 
 
-def build_output(history: dict, universe: dict) -> dict:
+def build_output(history: dict, universe: dict, shares: dict | None = None) -> dict:
+    shares_as_of = None
+    if shares is None:
+        stored = load_shares()
+        shares, shares_as_of = (stored["shares"], stored["asOf"]) if stored else ({}, None)
     dates = sorted(history["days"])
     latest = dates[-1]
     prior = dates[:-1][-AVG_WINDOW:]
@@ -208,6 +285,7 @@ def build_output(history: dict, universe: dict) -> dict:
             "industry": universe[sym]["industry"],
             "close": close,
             "prevClose": prev,
+            "mcapCr": round(close * shares[sym] / 1e7, 2) if sym in shares else None,
             "volume": vol,
             "turnoverCr": round(turnover_lacs / 100, 2) if turnover_lacs is not None else None,
             "avgVol20": round(avg) if avg else None,
@@ -220,16 +298,29 @@ def build_output(history: dict, universe: dict) -> dict:
         "demo": False,
         "sessionsUsed": len(prior),
         "universeSize": len(universe),
+        "mcap": {"loaded": any(s["mcapCr"] is not None for s in stocks), "asOf": shares_as_of},
         "stocks": stocks,
     }
 
 
-def run(universe_file: Path | None = None, bhav_text: str | None = None,
-        bhav_date: str | None = None, today: date | None = None) -> int:
-    """Refresh history and latest.json. Returns 0 on success, 1 if nothing could be produced."""
-    universe = load_universe(universe_file, prefer_cache=bhav_text is not None)
+def run(universe_file: Path | None = None, bhav_text: str | None = None, bhav_date: str | None = None,
+        mcap_text: str | None = None, today: date | None = None) -> int:
+    """Refresh history and latest.json. Returns 0 on success, 1 if nothing could be produced.
+
+    Hand-supplied files (bhav_text / mcap_text) never touch the network.
+    """
+    offline = bhav_text is not None or mcap_text is not None
+    universe = load_universe(universe_file, prefer_cache=offline)
     history = load_history()
     today = today or datetime.now(IST).date()
+
+    if mcap_text is not None:
+        shares = parse_mcap(mcap_text, universe)
+        if not shares:
+            log("Uploaded MCAP file matched no NIFTY 500 symbols (needs Symbol and Issue Size columns).")
+            return 1
+        save_shares(shares, today.isoformat())
+        log(f"shares stored for {len(shares)} symbols")
 
     if bhav_text is not None:
         if not bhav_date:
@@ -239,11 +330,14 @@ def run(universe_file: Path | None = None, bhav_text: str | None = None,
             log("Uploaded file matched no NIFTY 500 symbols; leaving output untouched.")
             return 1
         history["days"][bhav_date] = parsed
-    else:
+    elif mcap_text is None:
         # one more than the window so the newest session still has a full 20 to compare against
         collect_sessions(history, universe, today, want=AVG_WINDOW + 1)
+        refresh_shares(universe, today)
 
     if not history["days"]:
+        if mcap_text is not None:
+            return 0  # shares saved; there is no price history to rebuild the list from yet
         log("No sessions available; leaving output untouched.")
         return 1
     for old in sorted(history["days"])[:-KEEP_SESSIONS]:
@@ -256,7 +350,8 @@ def run(universe_file: Path | None = None, bhav_text: str | None = None,
 
     write_atomic(history_path(), json.dumps(history, separators=(",", ":")))
     write_atomic(output_path(), json.dumps(out, separators=(",", ":")))
-    log(f"asOf {out['asOf']}: {len(out['stocks'])}/{len(universe)} stocks, {out['sessionsUsed']} prior sessions")
+    log(f"asOf {out['asOf']}: {len(out['stocks'])}/{len(universe)} stocks, {out['sessionsUsed']} prior sessions, "
+        f"market cap {'loaded' if out['mcap']['loaded'] else 'missing'}")
     return 0
 
 
@@ -265,6 +360,7 @@ def main() -> int:
     ap.add_argument("--universe-file", type=Path, help="local ind_nifty500list.csv instead of downloading")
     ap.add_argument("--bhav-file", type=Path, help="local sec_bhavdata_full csv to ingest (needs --bhav-date)")
     ap.add_argument("--bhav-date", help="YYYY-MM-DD session date of --bhav-file")
+    ap.add_argument("--mcap-file", type=Path, help="local NSE MCAP csv (shares outstanding per stock)")
     ap.add_argument("--today", help="YYYY-MM-DD, override 'today' (IST)")
     args = ap.parse_args()
     if args.bhav_file and not args.bhav_date:
@@ -273,6 +369,7 @@ def main() -> int:
         universe_file=args.universe_file,
         bhav_text=args.bhav_file.read_text(encoding="utf-8") if args.bhav_file else None,
         bhav_date=args.bhav_date,
+        mcap_text=args.mcap_file.read_text(encoding="utf-8") if args.mcap_file else None,
         today=date.fromisoformat(args.today) if args.today else None,
     )
 

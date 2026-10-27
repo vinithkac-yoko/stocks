@@ -332,6 +332,14 @@ class Handler(BaseHTTPRequestHandler):
         if m and method == "DELETE":
             s.store.clear_invested(int(m[1]))
             return self._json(200, {"ok": True})
+        m = re.fullmatch(r"/api/picks/(\d+)/ignore", path)
+        if m and method in ("POST", "DELETE"):
+            s.store.set_ignored(int(m[1]), method == "POST")
+            return self._json(200, {"ok": True})
+        m = re.fullmatch(r"/api/holdings/([^/]+)/sells", path)
+        if m and method == "POST":
+            d = self._json_body(body)
+            return self._json(200, {"sells": s.store.sell_holding(unquote(m[1]), d.get("qty"), d.get("price"), d.get("soldOn"))})
         m = re.fullmatch(r"/api/picks/(\d+)/sells", path)
         if m and method == "POST":
             d = self._json_body(body)
@@ -357,8 +365,10 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 raise ApiError(400, "date=YYYY-MM-DD is required") from None
             ok = self.server.refresher.run_once(bhav_text=text, bhav_date=session)
+        elif kind == "mcap":
+            ok = self.server.refresher.run_once(mcap_text=text)
         else:
-            raise ApiError(400, "kind must be 'universe' or 'bhav'")
+            raise ApiError(400, "kind must be 'universe', 'bhav' or 'mcap'")
         self._json(200 if ok else 422, {"ok": ok, "refresh": self.server.refresher.status()})
 
 

@@ -26,6 +26,7 @@ for i in range(1, 501):
         "industry": INDUSTRIES[i % len(INDUSTRIES)],
         "close": close,
         "prevClose": prev,
+        "mcapCr": round(close * rng.lognormvariate(18.5, 1.1) / 1e7, 2),
         "volume": vol,
         "turnoverCr": round(vol * close / 1e7, 2),
         "avgVol20": avg,
@@ -36,6 +37,6 @@ for i in range(1, 501):
 OUT.parent.mkdir(parents=True, exist_ok=True)
 OUT.write_text(json.dumps({
     "asOf": "2026-10-26", "generatedAt": "2026-10-27T00:00:00+05:30", "demo": True,
-    "sessionsUsed": 20, "universeSize": 500, "stocks": stocks,
+    "sessionsUsed": 20, "universeSize": 500, "mcap": {"loaded": True, "asOf": "2026-10-26"}, "stocks": stocks,
 }, separators=(",", ":")), encoding="utf-8")
 print(f"wrote {OUT} ({len(stocks)} fake stocks)")

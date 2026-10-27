@@ -2,7 +2,7 @@
 //
 // Shapes (camelCase everywhere in the app):
 //   cycle { id, startedOn }
-//   pick  { id, cycleId, symbol, pickedOn, status: 'picked'|'invested', entryPrice, qty, investedOn, sells: [sell] }
+//   pick  { id, cycleId, symbol, pickedOn, status: 'picked'|'ignored'|'invested', entryPrice, qty, investedOn, sells: [sell] }
 //   sell  { id, qty, price, soldOn }
 
 async function call(method, path, body) {
@@ -35,6 +35,8 @@ export function createStore() {
     removePick: (id) => call('DELETE', `/api/picks/${id}`),
     setInvested: (id, { entryPrice, qty, investedOn }) => call('PUT', `/api/picks/${id}/invest`, { entryPrice, qty, investedOn }),
     clearInvested: (id) => call('DELETE', `/api/picks/${id}/invest`),
+    setIgnored: (id, ignored) => call(ignored ? 'POST' : 'DELETE', `/api/picks/${id}/ignore`),
+    sellHolding: (symbol, { qty, price, soldOn }) => call('POST', `/api/holdings/${encodeURIComponent(symbol)}/sells`, { qty, price, soldOn }),
     addSell: async (pickId, { qty, price, soldOn }) => (await call('POST', `/api/picks/${pickId}/sells`, { qty, price, soldOn })).id,
     removeSell: (id) => call('DELETE', `/api/sells/${id}`),
   };
