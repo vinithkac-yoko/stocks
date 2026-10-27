@@ -7,8 +7,8 @@ const MIN_SESSIONS_FOR_RELVOL = 5;
 
 const S = {
   store: null, data: null, stockMap: new Map(),
-  cycles: [], picks: [],
-  tab: 'today', rank: 'relVol', q: '', investingId: null,
+  cycles: [], picks: [], refresh: null, ephemeral: false,
+  tab: 'today', rank: 'relVol', q: '', investingId: null, selling: null,
 };
 
 // ------------------------------------------------------------- helpers ----
@@ -42,8 +42,42 @@ function delta(value, text) {
   const arrow = value > 0 ? '▲' : value < 0 ? '▼' : '';
   return `<span class="${cls} num">${arrow} ${text}</span>`;
 }
+// Compact date for tables: "27 Oct", plus the year only when it isn't this year.
+function fmtShort(iso) {
+  const [y, m, d] = iso.split('-').map(Number);
+  const opts = { day: 'numeric', month: 'short' };
+  if (y !== new Date().getFullYear()) opts.year = '2-digit';
+  return new Date(y, m - 1, d).toLocaleDateString('en-IN', opts);
+}
+// Market cap arrives in crore rupees; large caps read better in lakh crore.
+const crore = (n) => (n >= 1e5 ? `${(n / 1e5).toFixed(2)} L Cr` : `${Math.round(n).toLocaleString('en-IN')} Cr`);
 const pct = (n) => `${Math.abs(n).toFixed(2)}%`;
 const changePct = (s) => (s && s.prevClose ? ((s.close - s.prevClose) / s.prevClose) * 100 : null);
+
+const soldQty = (p) => p.sells.reduce((a, s) => a + s.qty, 0);
+const openQty = (p) => (p.status === 'invested' ? p.qty - soldQty(p) : 0);
+
+const cmpId = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true });
+const lotOrder = (a, b) => (a.investedOn || '').localeCompare(b.investedOn || '') || cmpId(a.id, b.id);
+// A stock bought in several cycles is several lots; selling by symbol takes the oldest lot first.
+const lotsOf = (symbol) => S.picks.filter((p) => p.symbol === symbol && openQty(p) > 0).sort(lotOrder);
+function holdingOf(symbol) {
+  const lots = lotsOf(symbol), qty = lots.reduce((n, p) => n + openQty(p), 0);
+  if (!qty) return null;
+  return { lots, qty, avg: lots.reduce((n, p) => n + openQty(p) * p.entryPrice, 0) / qty };
+}
+// Which lots (and how many shares of each) a sale touches. `sel` is {id} for one lot or {symbol} for the holding.
+function allocate(sel, qty) {
+  const lots = sel.id != null ? [findPick(sel.id)].filter(Boolean) : lotsOf(sel.symbol);
+  const out = [];
+  let left = qty;
+  for (const pick of lots) {
+    const take = Math.min(left, openQty(pick));
+    if (take > 0) out.push({ pick, qty: take });
+    left -= take;
+  }
+  return left > 0 || !out.length ? null : out;
+}
 
 let toastTimer;
 function toast(msg) {
@@ -76,25 +110,31 @@ function stats() {
   const universe = S.data ? S.data.stocks.length : 0;
   const reviewed = cyclePicks.filter((p) => S.stockMap.has(p.symbol)).length;
   const todays = cyclePicks.filter((p) => p.pickedOn === today);
-  const open = S.picks.filter((p) => p.status === 'invested');
-  let deployed = 0, costPriced = 0, pnl = 0;
+  const open = S.picks.filter((p) => openQty(p) > 0);
+
+  let deployed = 0, costPriced = 0, unrealised = 0;
   for (const p of open) {
-    const cost = p.entryPrice * p.qty; deployed += cost;
+    const cost = p.entryPrice * openQty(p); deployed += cost;
     const s = S.stockMap.get(p.symbol);
-    if (s) { costPriced += cost; pnl += (s.close - p.entryPrice) * p.qty; }
+    if (s) { costPriced += cost; unrealised += (s.close - p.entryPrice) * openQty(p); }
   }
+  let realised = 0, sales = 0, wins = 0;
+  for (const p of S.picks) for (const s of p.sells) { const pl = (s.price - p.entryPrice) * s.qty; realised += pl; sales++; if (pl > 0) wins++; }
+
   return {
     cyc, cyclePicks, universe, reviewed, remaining: Math.max(0, universe - reviewed),
     daysUsed: new Set(cyclePicks.map((p) => p.pickedOn)).size,
     cycleDays: Math.ceil(universe / BATCH) || 0,
     todays, todaysInvested: todays.filter((p) => p.status === 'invested').length,
+    todaysIgnored: todays.filter((p) => p.status === 'ignored').length,
     investedInCycle: cyclePicks.filter((p) => p.status === 'invested').length,
-    open, deployed, pnl, pnlPct: costPriced ? (pnl / costPriced) * 100 : null,
+    open, deployed, unrealised, unrealisedPct: costPriced ? (unrealised / costPriced) * 100 : null,
+    realised, sales, wins,
   };
 }
 
-function ranked(pickedSymbols) {
-  const key = S.rank, q = S.q.trim().toLowerCase();
+function ranked(pickedSymbols, withSearch = true) {
+  const key = S.rank, q = withSearch ? S.q.trim().toLowerCase() : '';
   const val = (s) => (s[key] == null ? -1 : s[key]);
   return S.data.stocks
     .filter((s) => !pickedSymbols.has(s.symbol))
@@ -104,9 +144,10 @@ function ranked(pickedSymbols) {
 
 // Optimistic update: show the change at once, roll back if saving fails.
 async function act(apply, persist, failMsg) {
-  const snap = { picks: S.picks.map((p) => ({ ...p })), cycles: S.cycles.map((c) => ({ ...c })) };
+  const snap = { picks: S.picks.map((p) => ({ ...p, sells: p.sells.map((s) => ({ ...s })) })), cycles: S.cycles.map((c) => ({ ...c })) };
   apply(); render();
   try { await persist(); } catch (e) {
+    if (e.status === 401) return showLogin('Session expired. Enter your passcode.');
     S.picks = snap.picks; S.cycles = snap.cycles; render();
     toast(`${failMsg}: ${e.message}`);
   }
@@ -117,27 +158,28 @@ async function act(apply, persist, failMsg) {
 function render() {
   if (!S.data) return;
   const st = stats();
-  renderChrome(st);
+  renderChrome();
   const views = { today: renderToday, portfolio: renderPortfolio, history: renderHistory };
   $('#app').innerHTML = views[S.tab](st);
 }
 
-function renderChrome(st) {
+function renderChrome() {
   const asOf = $('#asOf');
   asOf.hidden = false; asOf.textContent = `Close · ${fmtDate(S.data.asOf)}`;
-  const mode = $('#mode');
-  mode.hidden = S.store.mode !== 'local'; mode.textContent = 'Saved on this device';
-  $('#signout').hidden = S.store.mode !== 'cloud';
+  $('#signout').hidden = false;
   $('#tabs').hidden = false;
   for (const b of document.querySelectorAll('#tabs button')) {
     if (b.dataset.tab === S.tab) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
   }
-  const banner = $('#banner');
   const age = (Date.now() - new Date(S.data.asOf).getTime()) / 864e5;
-  let msg = '';
-  if (S.data.demo) msg = '<b>Demo data.</b> These are made-up stocks and numbers. The first successful “Update NSE data” run replaces them with the real NIFTY 500.';
-  else if (age > 5) msg = `Data is from ${fmtDate(S.data.asOf)}. The daily update may have failed; check the “Update NSE data” workflow.`;
-  banner.hidden = !msg; banner.innerHTML = msg ? `<div>${msg}</div>` : '';
+  const msgs = [];
+  if (S.ephemeral) msgs.push('<b>No volume attached.</b> Your picks and sales will be erased on the next deploy. Add a Railway volume (see README).');
+  if (!S.data.demo && !(S.data.mcap && S.data.mcap.loaded)) msgs.push('Market cap isn\'t loaded yet, so the list is ordered by turnover. Upload NSE\'s MCAP file (see README).');
+  if (S.data.demo) msgs.push('<b>Demo data.</b> Made-up stocks and numbers, until the first NSE download succeeds.');
+  else if (age > 5) msgs.push(`Data is from ${fmtDate(S.data.asOf)}; the daily update may be failing.`);
+  if (S.refresh && S.refresh.error) msgs.push(`Last NSE update failed: ${esc(S.refresh.error)}`);
+  const banner = $('#banner');
+  banner.hidden = !msgs.length; banner.innerHTML = msgs.map((m) => `<div>${m}</div>`).join('');
 }
 
 function kpi(label, value, sub, extra = '') {
@@ -145,13 +187,12 @@ function kpi(label, value, sub, extra = '') {
 }
 
 function renderKpis(st) {
-  const todayDone = st.todays.length;
   const progress = st.universe ? (st.reviewed / st.universe) * 100 : 0;
-  const pnlLine = st.open.length && st.pnlPct != null
-    ? `${delta(st.pnl, `${money(Math.abs(st.pnl))} (${pct(st.pnlPct)})`)}`
+  const pnlLine = st.open.length && st.unrealisedPct != null
+    ? delta(st.unrealised, `${money(Math.abs(st.unrealised))} (${pct(st.unrealisedPct)})`)
     : 'No open positions';
   return `<div class="kpis">
-    ${kpi("Today's batch", `${todayDone} <small>/ ${BATCH}</small>`, `${st.todaysInvested} invested · ${todayDone - st.todaysInvested} to decide`)}
+    ${kpi("Today's batch", `${st.todays.length} <small>/ ${BATCH}</small>`, `${st.todaysInvested} invested · ${st.todaysIgnored} ignored · ${st.todays.length - st.todaysInvested - st.todaysIgnored} to decide`)}
     ${kpi('Cycle progress', `${st.reviewed} <small>/ ${st.universe}</small>`,
       st.daysUsed ? `Day ${st.daysUsed} of ${st.cycleDays} · ${st.remaining} left` : `${st.cycleDays} days at ${BATCH} a day`,
       `<div class="track" role="progressbar" aria-label="Cycle progress" aria-valuenow="${st.reviewed}" aria-valuemin="0" aria-valuemax="${st.universe}"><i style="width:${progress.toFixed(1)}%"></i></div>`)}
@@ -160,16 +201,50 @@ function renderKpis(st) {
   </div>`;
 }
 
+function renderPortfolioKpis(st) {
+  const total = st.unrealised + st.realised;
+  const pnl = (v) => delta(v, money(Math.abs(v)));
+  return `<div class="kpis">
+    ${kpi('Open positions', `${st.open.length}`, `${money(st.deployed)} at cost`)}
+    ${kpi('Unrealised P&amp;L', st.open.length ? pnl(st.unrealised) : '—', st.unrealisedPct != null ? `${delta(st.unrealised, pct(st.unrealisedPct))} on open positions` : 'Nothing open')}
+    ${kpi('Realised P&amp;L', st.sales ? pnl(st.realised) : '—', st.sales ? `${st.wins} of ${st.sales} sales in profit` : 'No sales yet')}
+    ${kpi('Total P&amp;L', st.open.length || st.sales ? pnl(total) : '—', 'Realised + unrealised, before charges')}
+  </div>`;
+}
+
+function badge(p) {
+  if (p.status === 'ignored') return '<span class="badge">Ignored</span>';
+  if (p.status !== 'invested') return '';
+  const open = openQty(p), sold = p.qty - open;
+  if (open === 0) return '<span class="badge">Sold</span>';
+  return `<span class="badge in">✓ ${open} × ${price(p.entryPrice)}${sold ? ` · ${sold} sold` : ''}</span>`;
+}
+
+// The decision buttons for a pick, shared by Today and History.
+function decisionButtons(p, small = true) {
+  const sm = small ? ' sm' : '';
+  const h = holdingOf(p.symbol);
+  let acts;
+  if (p.status === 'invested') acts = `${badge(p)}<button class="btn quiet${sm}" data-action="invest" data-id="${p.id}">Edit</button>`;
+  else if (p.status === 'ignored') acts = `${badge(p)}<button class="btn quiet${sm}" data-action="unignore" data-id="${p.id}">Decide</button>`;
+  else acts = `<button class="btn primary${sm}" data-action="invest" data-id="${p.id}">Invest</button><button class="btn${sm}" data-action="ignore" data-id="${p.id}">Ignore</button>`;
+  if (h) acts += `<button class="btn${sm}" data-action="sellholding" data-sym="${esc(p.symbol)}">Sell</button>`;
+  return acts;
+}
+
 function batchRow(p) {
-  const s = S.stockMap.get(p.symbol), ch = changePct(s);
-  const action = p.status === 'invested'
-    ? `<span class="badge in">✓ ${p.qty} × ${price(p.entryPrice)}</span><button class="btn quiet sm" data-action="invest" data-id="${p.id}">Edit</button>`
-    : `<button class="btn primary sm" data-action="invest" data-id="${p.id}">Invest</button>`;
+  const s = S.stockMap.get(p.symbol), ch = changePct(s), h = holdingOf(p.symbol);
+  let hold = '';
+  if (h) {
+    const pl = s ? (s.close - h.avg) * h.qty : null;
+    hold = `<div class="hold">You hold <b class="num">${h.qty}</b> · avg ${price(h.avg)}${s ? ` · ${delta(pl, pct(((s.close - h.avg) / h.avg) * 100))}` : ''}</div>`;
+  }
   return `<div class="batch-row">
     <div class="who"><span class="sym">${esc(p.symbol)}</span><span class="name">${esc(s ? s.name : '')}</span></div>
     <div class="price num">${s ? price(s.close) : '—'}<small>${delta(ch, ch == null ? '' : pct(ch))}</small></div>
-    ${action}
     <button class="btn quiet sm" data-action="remove" data-id="${p.id}" aria-label="Remove ${esc(p.symbol)} from today's batch" title="Remove">✕</button>
+    ${hold}
+    <div class="acts">${decisionButtons(p)}</div>
   </div>`;
 }
 
@@ -177,16 +252,17 @@ function poolRows(st) {
   const picked = new Set(st.cyclePicks.map((p) => p.symbol));
   const full = st.todays.length >= BATCH;
   const rows = ranked(picked);
-  if (!rows.length) return `<tr><td colspan="8" class="empty">${S.q ? 'No match in the remaining list.' : 'Everything has been reviewed this cycle.'}</td></tr>`;
+  if (!rows.length) return `<tr><td colspan="9" class="empty">${S.q ? 'No match in the remaining list.' : 'Everything has been reviewed this cycle.'}</td></tr>`;
   return rows.map((s, i) => {
     const ch = changePct(s);
     const rv = s.relVol == null ? '<span class="muted">—</span>'
       : `<div class="rv"><span class="bar"><i style="width:${Math.min(s.relVol / REL_VOL_BAR_MAX, 1) * 100}%"></i></span><b class="num">${s.relVol.toFixed(2)}×</b></div>`;
     return `<tr>
-      <td class="rank num">${i + 1}</td>
+      <td class="rank num opt2">${i + 1}</td>
       <td><span class="sym">${esc(s.symbol)}</span><span class="name">${esc(s.name)}</span></td>
-      <td class="r num">${price(s.close)}</td>
-      <td class="r">${delta(ch, ch == null ? '' : pct(ch))}</td>
+      <td class="r num">${s.mcapCr == null ? '—' : crore(s.mcapCr)}</td>
+      <td class="r num opt2">${price(s.close)}</td>
+      <td class="r opt2">${delta(ch, ch == null ? '' : pct(ch))}</td>
       <td class="r">${rv}</td>
       <td class="r num opt">${qtyCompact(s.volume)}</td>
       <td class="r num opt">${s.delivPct == null ? '—' : s.delivPct.toFixed(1) + '%'}</td>
@@ -199,16 +275,18 @@ function renderToday(st) {
   const lowHistory = S.data.sessionsUsed < MIN_SESSIONS_FOR_RELVOL;
   const batch = st.todays.length
     ? st.todays.map(batchRow).join('')
-    : `<div class="empty">Tap <b>Add</b> on stocks in the ranked list to build today's batch of ${BATCH}.</div>`;
+    : `<div class="empty">Tap <b>Get today's ${BATCH}</b> for the next ${BATCH} on the list, or <b>Add</b> stocks yourself.</div>`;
   const done = st.universe > 0 && st.remaining === 0;
-  const seg = [['relVol', 'Rel. volume'], ['turnoverCr', 'Turnover'], ['volume', 'Shares']]
+  const need = Math.min(BATCH - st.todays.length, ranked(new Set(st.cyclePicks.map((p) => p.symbol)), false).length);
+  const fill = need > 0 ? `<button class="btn primary sm" data-action="fill" title="Adds the next ${need} from the ranked list, in the order shown">${st.todays.length ? `Add next ${need}` : `Get today's ${need}`}</button>` : '';
+  const seg = [['mcapCr', 'Mkt cap'], ['relVol', 'Rel. vol'], ['turnoverCr', 'Turnover'], ['volume', 'Shares']]
     .map(([k, l]) => `<button data-action="rank" data-rank="${k}" aria-pressed="${S.rank === k}">${l}</button>`).join('');
   return `${renderKpis(st)}
   ${done ? `<div class="panel" style="margin-bottom:20px"><div class="empty"><b>Cycle complete.</b> All ${st.universe} stocks reviewed.<br><br>
     <button class="btn primary" data-action="newcycle">Start a new cycle</button></div></div>` : ''}
   <div class="cols">
     <section class="panel" aria-label="Today's batch">
-      <div class="panel-head"><h2>Today's batch</h2><span class="muted num">${st.todays.length} / ${BATCH}</span></div>
+      <div class="panel-head"><h2>Today's batch</h2><span class="muted num">${st.todays.length} / ${BATCH}</span>${fill}</div>
       ${batch}
     </section>
     <section class="panel" aria-label="Ranked list">
@@ -217,9 +295,9 @@ function renderToday(st) {
         <div class="seg" role="group" aria-label="Rank by">${seg}</div>
         <input class="search" type="search" id="search" placeholder="Search symbol or name" value="${esc(S.q)}" aria-label="Search">
       </div>
-      ${lowHistory ? `<div class="pad muted" style="padding-bottom:0">Only ${S.data.sessionsUsed} earlier session(s) loaded, so relative volume is not available yet. Use Turnover for now.</div>` : ''}
+      ${lowHistory && S.rank === 'relVol' ? `<div class="pad muted" style="padding-bottom:0">Only ${S.data.sessionsUsed} earlier session(s) loaded, so relative volume is not available yet. Use Turnover for now.</div>` : ''}
       <div class="scroll"><table>
-        <thead><tr><th>#</th><th>Stock</th><th class="r">Price</th><th class="r">Change</th>
+        <thead><tr><th class="opt2">#</th><th>Stock</th><th class="r">Mkt cap</th><th class="r opt2">Price</th><th class="r opt2">Change</th>
           <th class="r" title="Today's volume ÷ 20-day average">Rel. volume</th><th class="r opt">Volume</th><th class="r opt" title="Delivery % of traded quantity">Deliv.</th><th></th></tr></thead>
         <tbody id="poolBody">${poolRows(st)}</tbody>
       </table></div>
@@ -228,44 +306,70 @@ function renderToday(st) {
 }
 
 function renderPortfolio(st) {
-  if (!st.open.length) return `<section class="panel"><div class="empty">No positions yet. Mark a stock as <b>Invested</b> from Today and it will appear here.</div></section>`;
-  const rows = [...st.open].sort((a, b) => (b.investedOn || '').localeCompare(a.investedOn || '') || b.id - a.id);
+  const closed = S.picks.flatMap((p) => p.sells.map((s) => ({ p, s })))
+    .sort((a, b) => b.s.soldOn.localeCompare(a.s.soldOn) || String(b.s.id).localeCompare(String(a.s.id), undefined, { numeric: true }));
+  if (!st.open.length && !closed.length) {
+    return `${renderPortfolioKpis(st)}<section class="panel"><div class="empty">No positions yet. Mark a stock as <b>Invested</b> from Today and it will appear here.</div></section>`;
+  }
+
   let cost = 0, value = 0, unpriced = 0;
-  const body = rows.map((p) => {
-    const s = S.stockMap.get(p.symbol), invested = p.entryPrice * p.qty;
-    cost += invested;
+  const rows = [...st.open].sort((a, b) => (b.investedOn || '').localeCompare(a.investedOn || '') || String(b.id).localeCompare(String(a.id), undefined, { numeric: true }));
+  const openBody = rows.map((p) => {
+    const s = S.stockMap.get(p.symbol), q = openQty(p), held = p.entryPrice * q, sold = p.qty - q;
+    cost += held;
     let pl = '<span class="muted">—</span>', plp = pl, val = '—';
     if (s) {
-      const v = s.close * p.qty; value += v; val = money(v);
-      pl = delta(v - invested, money(Math.abs(v - invested)));
-      plp = delta(v - invested, pct(((s.close - p.entryPrice) / p.entryPrice) * 100));
-    } else unpriced += invested;
+      const v = s.close * q; value += v; val = money(v);
+      pl = delta(v - held, money(Math.abs(v - held)));
+      plp = delta(v - held, pct(((s.close - p.entryPrice) / p.entryPrice) * 100));
+    } else unpriced += held;
     return `<tr>
       <td><span class="sym">${esc(p.symbol)}</span><span class="name">${esc(s ? s.name : 'Not in latest data')}</span></td>
-      <td class="opt num">${fmtDate(p.investedOn)}</td>
-      <td class="r num">${p.qty}</td>
-      <td class="r num">${price(p.entryPrice)}</td>
-      <td class="r num">${s ? price(s.close) : '—'}</td>
-      <td class="r num opt">${money(invested)}</td>
+      <td class="opt num">${fmtShort(p.investedOn)}</td>
+      <td class="r num">${q}${sold ? `<span class="name" style="margin-left:auto">of ${p.qty}</span>` : ''}</td>
+      <td class="r num opt2">${price(p.entryPrice)}</td>
+      <td class="r num opt2">${s ? price(s.close) : '—'}</td>
+      <td class="r num opt">${money(held)}</td>
       <td class="r num opt">${val}</td>
       <td class="r">${pl}</td>
-      <td class="r">${plp}</td>
-      <td class="r" style="white-space:nowrap"><button class="btn quiet sm" data-action="invest" data-id="${p.id}">Edit</button>
-        <button class="btn quiet sm" data-action="undo" data-id="${p.id}" title="Move back to 'to decide'">Undo</button></td>
+      <td class="r opt2">${plp}</td>
+      <td class="r actions"><button class="btn sm" data-action="sell" data-id="${p.id}">Sell</button>
+        <button class="btn quiet sm" data-action="invest" data-id="${p.id}">Edit</button>
+        ${sold ? '' : `<button class="btn quiet sm" data-action="undo" data-id="${p.id}" title="Move back to 'to decide'">Undo</button>`}</td>
     </tr>`;
   }).join('');
-  const priced = cost - unpriced, totalPl = value - priced;
-  return `${renderKpis(st)}
-  <section class="panel"><div class="panel-head"><h2>Portfolio</h2><span class="muted">Prices are the close of ${fmtDate(S.data.asOf)}</span></div>
+  const priced = cost - unpriced, openPl = value - priced;
+  const openPanel = st.open.length ? `<section class="panel" style="margin-bottom:20px"><div class="panel-head"><h2>Open positions</h2><span class="muted">Prices are the close of ${fmtDate(S.data.asOf)}</span></div>
   <div class="scroll"><table>
-    <thead><tr><th>Stock</th><th class="opt">Bought</th><th class="r">Qty</th><th class="r">Entry</th><th class="r">Last</th>
-      <th class="r opt">Invested</th><th class="r opt">Value</th><th class="r">P&amp;L</th><th class="r">P&amp;L %</th><th></th></tr></thead>
-    <tbody>${body}</tbody>
-    <tfoot><tr><td>Total</td><td class="opt"></td><td></td><td></td><td></td>
+    <thead><tr><th>Stock</th><th class="opt">Bought</th><th class="r">Qty</th><th class="r opt2">Entry</th><th class="r opt2">Last</th>
+      <th class="r opt">Cost</th><th class="r opt">Value</th><th class="r">P&amp;L</th><th class="r opt2">P&amp;L %</th><th></th></tr></thead>
+    <tbody>${openBody}</tbody>
+    <tfoot><tr><td>Total</td><td class="opt"></td><td></td><td class="opt2"></td><td class="opt2"></td>
       <td class="r num opt">${money(cost)}</td><td class="r num opt">${money(value)}</td>
-      <td class="r">${delta(totalPl, money(Math.abs(totalPl)))}</td>
-      <td class="r">${priced ? delta(totalPl, pct((totalPl / priced) * 100)) : '—'}</td><td></td></tr></tfoot>
-  </table></div></section>`;
+      <td class="r">${delta(openPl, money(Math.abs(openPl)))}</td>
+      <td class="r opt2">${priced ? delta(openPl, pct((openPl / priced) * 100)) : '—'}</td><td></td></tr></tfoot>
+  </table></div></section>` : '';
+
+  const closedBody = closed.map(({ p, s }) => {
+    const pl = (s.price - p.entryPrice) * s.qty, plPct = ((s.price - p.entryPrice) / p.entryPrice) * 100;
+    return `<tr>
+      <td><span class="sym">${esc(p.symbol)}</span></td>
+      <td class="num opt">${fmtShort(s.soldOn)}</td>
+      <td class="r num">${s.qty}</td>
+      <td class="r num opt">${price(p.entryPrice)}</td>
+      <td class="r num">${price(s.price)}</td>
+      <td class="r">${delta(pl, money(Math.abs(pl)))}</td>
+      <td class="r opt2">${delta(pl, pct(plPct))}</td>
+      <td class="r"><button class="btn quiet sm" data-action="undosale" data-id="${s.id}" title="Delete this sale">Undo</button></td>
+    </tr>`;
+  }).join('');
+  const closedPanel = closed.length ? `<section class="panel"><div class="panel-head"><h2>Sales</h2><span class="muted">${st.wins} of ${st.sales} in profit</span></div>
+  <div class="scroll"><table>
+    <thead><tr><th>Stock</th><th class="opt">Sold</th><th class="r">Qty</th><th class="r opt">Entry</th><th class="r">Exit</th><th class="r">P&amp;L</th><th class="r opt2">P&amp;L %</th><th></th></tr></thead>
+    <tbody>${closedBody}</tbody>
+    <tfoot><tr><td>Realised</td><td class="opt"></td><td></td><td class="opt"></td><td></td><td class="r">${delta(st.realised, money(Math.abs(st.realised)))}</td><td class="opt2"></td><td></td></tr></tfoot>
+  </table></div></section>` : '';
+  return `${renderPortfolioKpis(st)}${openPanel}${closedPanel}`;
 }
 
 function renderHistory(st) {
@@ -274,11 +378,9 @@ function renderHistory(st) {
   const days = [...groups.keys()].sort().reverse().map((d) => {
     const ps = groups.get(d);
     const pills = ps.map((p) => `<span class="pill"><span class="sym">${esc(p.symbol)}</span>
-      ${p.status === 'invested'
-        ? `<span class="badge in">✓ ${p.qty} × ${price(p.entryPrice)}</span><button class="btn quiet" data-action="invest" data-id="${p.id}">Edit</button>`
-        : `<button class="btn" data-action="invest" data-id="${p.id}">Invest</button>`}
+      ${decisionButtons(p, false)}
       <button class="btn quiet" data-action="remove" data-id="${p.id}" aria-label="Remove ${esc(p.symbol)}">✕</button></span>`).join('');
-    return `<div class="day"><h3>${fmtDate(d, true)} · ${ps.length} picked · ${ps.filter((p) => p.status === 'invested').length} invested</h3><div class="items">${pills}</div></div>`;
+    return `<div class="day"><h3>${fmtDate(d, true)} · ${ps.length} picked · ${ps.filter((p) => p.status === 'invested').length} invested · ${ps.filter((p) => p.status === 'ignored').length} ignored</h3><div class="items">${pills}</div></div>`;
   }).join('');
   const past = S.cycles.slice(0, -1).map((c) => {
     const ps = S.picks.filter((p) => p.cycleId === c.id);
@@ -293,22 +395,27 @@ function renderHistory(st) {
 }
 
 function showLogin(error = '') {
-  $('#tabs').hidden = true; $('#asOf').hidden = true; $('#mode').hidden = true; $('#signout').hidden = true;
+  $('#tabs').hidden = true; $('#asOf').hidden = true; $('#signout').hidden = true; $('#banner').hidden = true;
   $('#app').innerHTML = `<div class="login"><h2>Enter passcode</h2>
     <form id="loginForm"><input type="password" name="pass" autocomplete="current-password" aria-label="Passcode" required autofocus>
     <p class="err" role="alert">${esc(error)}</p><button class="btn primary" type="submit">Unlock</button></form></div>`;
 }
 
-// ----------------------------------------------------------- invest UI ----
+// -------------------------------------------------------------- dialogs ----
+
+const findPick = (id) => S.picks.find((p) => p.id === id);
 
 function openInvest(id) {
-  const p = S.picks.find((x) => x.id === id);
+  const p = findPick(id);
   if (!p || p._pending) return;
   S.investingId = id;
   const s = S.stockMap.get(p.symbol), f = $('#investForm');
   $('#investTitle').textContent = p.status === 'invested' ? `Edit ${p.symbol}` : `Invest in ${p.symbol}`;
-  $('#investSub').textContent = s ? `${s.name} · last close ${inr(s.close, 2)}` : '';
+  const h = p.status === 'invested' ? null : holdingOf(p.symbol);
+  $('#investSub').textContent = (s ? `${s.name} · current rate ${inr(s.close, 2)}` : '')
+    + (soldQty(p) ? ` · ${soldQty(p)} already sold` : '') + (h ? ` · you already hold ${h.qty}` : '');
   f.price.value = p.entryPrice ?? (s ? s.close : '');
+  f.qty.min = String(Math.max(1, soldQty(p)));
   f.qty.value = p.qty ?? '';
   f.date.value = p.investedOn ?? todayIST();
   updateInvestTotal();
@@ -320,23 +427,64 @@ function updateInvestTotal() {
   $('#investTotal').textContent = t > 0 ? `Total: ${inr(t, 2)}` : '';
 }
 
+// sel: {id} sells from one purchase (Portfolio rows); {symbol} sells from the whole holding (Today).
+function openSell(sel) {
+  const lots = sel.id != null ? [findPick(sel.id)].filter((p) => p && openQty(p) > 0) : lotsOf(sel.symbol);
+  if (!lots.length || lots.some((p) => p._pending)) return;
+  const symbol = lots[0].symbol, held = lots.reduce((n, p) => n + openQty(p), 0);
+  const avg = lots.reduce((n, p) => n + openQty(p) * p.entryPrice, 0) / held;
+  S.selling = { ...sel, symbol };
+  const s = S.stockMap.get(symbol), f = $('#sellForm');
+  $('#sellTitle').textContent = `Sell ${symbol}`;
+  $('#sellSub').textContent = `${held} held${lots.length > 1 ? ` in ${lots.length} purchases` : ''} · ${lots.length > 1 ? 'average' : 'bought at'} ${inr(avg, 2)}${s ? ` · current rate ${inr(s.close, 2)}` : ''}`;
+  f.qty.max = String(held);
+  f.qty.value = held;
+  f.price.value = s ? s.close : '';
+  f.date.value = todayIST();
+  updateSellPreview();
+  $('#sellDialog').showModal();
+  f.price.focus();
+}
+function updateSellPreview() {
+  const f = $('#sellForm'), el = $('#sellPreview');
+  const q = Number(f.qty.value), px = Number(f.price.value), alloc = S.selling && q > 0 ? allocate(S.selling, q) : null;
+  if (!alloc || !(px > 0)) { el.textContent = ''; el.className = ''; return; }
+  const cost = alloc.reduce((n, { pick, qty }) => n + pick.entryPrice * qty, 0), pl = px * q - cost;
+  const word = pl > 0 ? 'Profit' : pl < 0 ? 'Loss' : 'Break-even';
+  el.className = pl > 0 ? 'up' : pl < 0 ? 'down' : 'muted';
+  el.textContent = pl === 0 ? word : `${word} ${money(Math.abs(pl))} (${pl > 0 ? '+' : '−'}${pct((pl / cost) * 100)}) before charges`
+    + (alloc.length > 1 ? ', oldest purchase first' : '');
+}
+
 // -------------------------------------------------------------- events ----
 
 document.addEventListener('click', (e) => {
   const el = e.target.closest('[data-action]');
   if (!el) return;
   const { action, id, sym } = el.dataset, pid = id ? Number(id) : null;
-  const pick = pid != null ? S.picks.find((p) => p.id === pid) : null;
+  const pick = pid != null ? findPick(pid) : null;
   switch (action) {
     case 'tab': S.tab = el.dataset.tab; history.replaceState(null, '', '#' + S.tab); render(); break;
     case 'rank': S.rank = el.dataset.rank; render(); break;
     case 'theme': cycleTheme(); break;
-    case 'close-dialog': $('#investDialog').close(); break;
+    case 'close-dialog': el.closest('dialog').close(); break;
     case 'signout': S.store.logout().then(() => showLogin()); break;
     case 'invest': openInvest(pid); break;
+    case 'sell': openSell({ id: pid }); break;
+    case 'sellholding': openSell({ symbol: sym }); break;
+    case 'fill': fillBatch(); break;
+    case 'ignore':
+      if (!pick || pick._pending) break;
+      act(() => { pick.status = 'ignored'; }, () => S.store.setIgnored(pid, true), 'Could not save');
+      break;
+    case 'unignore':
+      if (!pick || pick._pending) break;
+      act(() => { pick.status = 'picked'; }, () => S.store.setIgnored(pid, false), 'Could not save');
+      break;
     case 'add': addPick(sym); break;
     case 'remove':
       if (!pick || pick._pending) break;
+      if (soldQty(pick)) { toast('This stock has sales recorded. Undo them in Portfolio first.'); break; }
       if (pick.status === 'invested' && !confirm(`Remove ${pick.symbol}? It is marked as invested and will leave your portfolio.`)) break;
       act(() => { S.picks = S.picks.filter((p) => p.id !== pid); }, () => S.store.removePick(pid), 'Could not remove');
       break;
@@ -344,6 +492,12 @@ document.addEventListener('click', (e) => {
       if (!pick || pick._pending || !confirm(`Mark ${pick.symbol} as not invested? Its entry details are cleared.`)) break;
       act(() => Object.assign(pick, { status: 'picked', entryPrice: null, qty: null, investedOn: null }), () => S.store.clearInvested(pid), 'Could not update');
       break;
+    case 'undosale': {
+      const owner = S.picks.find((p) => p.sells.some((s) => s.id === pid));
+      if (!owner || !confirm(`Delete this ${owner.symbol} sale? The shares return to your open position.`)) break;
+      act(() => { owner.sells = owner.sells.filter((s) => s.id !== pid); }, () => S.store.removeSell(pid), 'Could not undo sale');
+      break;
+    }
     case 'newcycle': {
       const st = stats();
       if (st.remaining > 0 && !confirm(`Only ${st.reviewed} of ${st.universe} reviewed. Start a new cycle anyway? Your portfolio is kept.`)) break;
@@ -353,11 +507,18 @@ document.addEventListener('click', (e) => {
   }
 });
 
+// "Get today's 10": the next stocks from the list in the order it is shown (ignoring the search box).
+function fillBatch() {
+  const st = stats();
+  const next = ranked(new Set(st.cyclePicks.map((p) => p.symbol)), false).slice(0, Math.max(0, BATCH - st.todays.length));
+  next.forEach((s) => addPick(s.symbol));
+}
+
 function addPick(symbol) {
   const st = stats();
   if (st.todays.length >= BATCH) return toast(`Today's batch is full (${BATCH}).`);
   if (st.cyclePicks.some((p) => p.symbol === symbol)) return;
-  const pick = { id: `tmp${Math.random()}`, cycleId: st.cyc.id, symbol, pickedOn: todayIST(), status: 'picked', entryPrice: null, qty: null, investedOn: null, _pending: true };
+  const pick = { id: `tmp${Math.random()}`, cycleId: st.cyc.id, symbol, pickedOn: todayIST(), status: 'picked', entryPrice: null, qty: null, investedOn: null, sells: [], _pending: true };
   act(() => S.picks.push(pick), async () => { pick.id = await S.store.addPick(pick.cycleId, symbol, pick.pickedOn); delete pick._pending; render(); }, 'Could not add');
 }
 
@@ -366,20 +527,37 @@ document.addEventListener('input', (e) => {
     S.q = e.target.value;
     $('#poolBody').innerHTML = poolRows(stats());
   } else if (e.target.closest('#investForm')) updateInvestTotal();
+  else if (e.target.closest('#sellForm')) updateSellPreview();
 });
 
 document.addEventListener('submit', async (e) => {
-  if (e.target.id === 'investForm') {
+  const form = e.target;
+  if (form.id === 'investForm') {
     e.preventDefault();
-    const f = e.target, entryPrice = Number(f.price.value), qty = Math.floor(Number(f.qty.value)), investedOn = f.date.value;
-    if (!(entryPrice > 0) || !(qty > 0) || !investedOn) return toast('Enter a price, quantity and date.');
-    const pick = S.picks.find((p) => p.id === S.investingId);
-    $('#investDialog').close();
+    const entryPrice = Number(form.price.value), qty = Math.floor(Number(form.qty.value)), investedOn = form.date.value;
+    const pick = findPick(S.investingId);
     if (!pick) return;
+    if (!(entryPrice > 0) || !(qty > 0) || !investedOn) return toast('Enter a price, quantity and date.');
+    if (qty < soldQty(pick)) return toast(`Quantity can't be below the ${soldQty(pick)} already sold.`);
+    $('#investDialog').close();
     act(() => Object.assign(pick, { status: 'invested', entryPrice, qty, investedOn }), () => S.store.setInvested(pick.id, { entryPrice, qty, investedOn }), 'Could not save');
-  } else if (e.target.id === 'loginForm') {
+  } else if (form.id === 'sellForm') {
     e.preventDefault();
-    try { await S.store.login(e.target.pass.value); await start(); } catch (err) { showLogin(err.message); }
+    const qty = Math.floor(Number(form.qty.value)), px = Number(form.price.value), soldOn = form.date.value, sel = S.selling;
+    if (!sel) return;
+    if (!(qty > 0) || !(px > 0) || !soldOn) return toast('Enter a quantity, price and date.');
+    const alloc = allocate(sel, qty);
+    if (!alloc) return toast('You don\'t hold that many shares.');
+    $('#sellDialog').close();
+    const sales = alloc.map(({ pick, qty: q }) => ({ pick, sale: { id: `tmp${Math.random()}`, qty: q, price: px, soldOn, _pending: true } }));
+    const apply = () => sales.forEach(({ pick, sale }) => pick.sells.push(sale));
+    const persist = sel.id != null
+      ? async () => { const { pick, sale } = sales[0]; sale.id = await S.store.addSell(pick.id, { qty, price: px, soldOn }); delete sale._pending; render(); }
+      : async () => { await S.store.sellHolding(sel.symbol, { qty, price: px, soldOn }); await reloadState(); };
+    act(apply, persist, 'Could not record sale');
+  } else if (form.id === 'loginForm') {
+    e.preventDefault();
+    try { await S.store.login(form.pass.value); await start(); } catch (err) { showLogin(err.message); }
   }
 });
 
@@ -391,17 +569,24 @@ async function loadData() {
     if (!res.ok) throw new Error(res.status);
     S.data = await res.json();
     S.stockMap = new Map(S.data.stocks.map((s) => [s.symbol, s]));
-    if (S.data.sessionsUsed < MIN_SESSIONS_FOR_RELVOL) S.rank = 'turnoverCr';
+    // Default order: biggest companies first. Fall back to what the data can support.
+    S.rank = S.data.mcap && S.data.mcap.loaded ? 'mcapCr' : 'turnoverCr';
   } catch {
-    $('#app').innerHTML = '<p class="pad">No market data yet. Run the “Update NSE data” workflow (see README), then reload.</p>';
+    $('#app').innerHTML = '<p class="pad">No market data yet. It downloads automatically after the NSE close; check the service logs if this persists.</p>';
     return false;
   }
   return true;
 }
 
-async function start() {
+async function reloadState() {
   const state = await S.store.load();
   S.cycles = state.cycles; S.picks = state.picks;
+  render();
+}
+
+async function start() {
+  const state = await S.store.load();
+  S.cycles = state.cycles; S.picks = state.picks; S.refresh = state.refresh; S.ephemeral = state.ephemeral;
   render();
 }
 
@@ -410,7 +595,7 @@ async function init() {
   const hash = location.hash.slice(1);
   if (['today', 'portfolio', 'history'].includes(hash)) S.tab = hash;
   try {
-    S.store = await createStore(CFG, todayIST);
+    S.store = createStore();
     if (!(await loadData())) return;
     if (await S.store.needsLogin()) return showLogin();
     await start();

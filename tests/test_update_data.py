@@ -69,6 +69,38 @@ class OutputTests(unittest.TestCase):
         self.assertTrue(all(s["relVol"] is None for s in out["stocks"]))
 
 
+MCAP = ("Trade Date, Symbol, Series, Security Name, Category, Face Value, Issue Size, Close Price, Market Cap(Rs.)\n"
+        "01-Oct-2026, AAA, EQ, Aaa Ltd, Listed, 10, 2000000000, 103.5, 207000000000\n"
+        "01-Oct-2026, BBB, EQ, Bbb Ltd, Listed, 1, 500000000, 50.5, 25250000000\n"
+        "01-Oct-2026, ZZZ, EQ, Not In Index, Listed, 1, 100, 1, 100\n")
+
+
+class McapTests(unittest.TestCase):
+    def test_issue_size_column_is_shares(self):
+        self.assertEqual(ud.parse_mcap(MCAP, UNIVERSE), {"AAA": 2_000_000_000, "BBB": 500_000_000})
+
+    def test_shares_derived_from_mcap_and_price_when_issue_size_missing(self):
+        text = "Symbol, Series, Close Price, Market Cap(Rs.)\nAAA, EQ, 100, 100000000000\n"
+        self.assertEqual(ud.parse_mcap(text, UNIVERSE), {"AAA": 1_000_000_000})
+
+    def test_unusable_file_gives_nothing(self):
+        self.assertEqual(ud.parse_mcap("Symbol, Series\nAAA, EQ\n", UNIVERSE), {})
+        self.assertEqual(ud.parse_mcap("", UNIVERSE), {})
+
+    def test_market_cap_is_close_times_shares_in_crore(self):
+        h = {"days": {"2026-10-01": {"AAA": [103.5, 100, 5000, 40, 55.0], "BBB": [50.5, 50, 1000, None, 10.0]}}, "holidays": []}
+        out = ud.build_output(h, UNIVERSE, shares={"AAA": 2_000_000_000})
+        by = {s["symbol"]: s for s in out["stocks"]}
+        self.assertEqual(by["AAA"]["mcapCr"], 20700.0)  # 103.5 x 2e9 / 1e7
+        self.assertIsNone(by["BBB"]["mcapCr"])           # no shares known for it
+        self.assertTrue(out["mcap"]["loaded"])
+
+    def test_no_shares_means_not_loaded(self):
+        h = {"days": {"2026-10-01": {"AAA": [103.5, 100, 5000, 40, 55.0]}}, "holidays": []}
+        out = ud.build_output(h, UNIVERSE, shares={})
+        self.assertFalse(out["mcap"]["loaded"])
+
+
 class CollectTests(unittest.TestCase):
     def run_collect(self, history, today, available):
         calls = []

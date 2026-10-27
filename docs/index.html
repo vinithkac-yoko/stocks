@@ -12,7 +12,6 @@
     <div class="top-inner">
       <h1>Daily 10</h1>
       <span class="chip" id="asOf" hidden></span>
-      <span class="chip" id="mode" hidden></span>
       <span class="spacer"></span>
       <button class="btn quiet sm" data-action="theme" title="Switch light / dark / auto">Theme</button>
       <button class="btn quiet sm" data-action="signout" id="signout" hidden>Sign out</button>
@@ -44,6 +43,27 @@
       <div class="dialog-actions">
         <button type="button" class="btn" data-action="close-dialog">Cancel</button>
         <button type="submit" class="btn primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="sellDialog">
+    <form method="dialog" id="sellForm" autocomplete="off">
+      <h2 id="sellTitle">Sell</h2>
+      <p class="muted" id="sellSub"></p>
+      <label>Quantity sold
+        <input name="qty" type="number" inputmode="numeric" step="1" min="1" required>
+      </label>
+      <label>Exit price (₹)
+        <input name="price" type="number" inputmode="decimal" step="any" min="0.01" required>
+      </label>
+      <label>Date
+        <input name="date" type="date" required>
+      </label>
+      <p id="sellPreview" aria-live="polite"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" data-action="close-dialog">Cancel</button>
+        <button type="submit" class="btn primary">Record sale</button>
       </div>
     </form>
   </dialog>
